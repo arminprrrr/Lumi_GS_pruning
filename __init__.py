@@ -2,16 +2,20 @@ import lichtfeld as lf
 
 from .panels.main_panel import ObjectConstraintPanel
 from .pruner import install_pruner, uninstall_pruner
+from .settings import GuardSettings, initialize_runtime_settings
 
 _classes = [ObjectConstraintPanel]
 
 
 def on_load():
+    initialize_runtime_settings(GuardSettings.get_instance())
+
     for cls in _classes:
         lf.register_class(cls)
 
     install_pruner()
     lf.log.info("Lumi_GS_pruning loaded")
+
 
 
 def on_unload():

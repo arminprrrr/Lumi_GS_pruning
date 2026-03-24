@@ -1,12 +1,13 @@
 import math
+from typing import Any
 
 import lichtfeld as lf
 from lfs_plugins.ui.state import AppState
 
-from .settings import GuardSettings
+from .settings import GuardSettings, save_persistent_settings
 
 _EPS = 1e-8
-_PLUGIN_OWNER = "object_constraint_guard"
+_PLUGIN_OWNER = "Lumi_GS_pruning"
 _PRUNER = None
 
 
@@ -19,6 +20,7 @@ def install_pruner():
     _PRUNER = ObjectConstraintPruner()
 
     lf.on_training_start(_PRUNER.on_training_start)
+    lf.on_post_step(_PRUNER.on_post_step)
     lf.on_training_end(_PRUNER.on_training_end)
 
 
@@ -39,11 +41,15 @@ class ObjectConstraintPruner:
         self.last_seen_iteration = -1
         self.last_pruned_iteration = -1
         self.last_counts = {"radius": 0, "max_axis": 0, "aspect": 0}
-        self.last_actions = []
+        self.last_actions: list[str] = []
+        self.last_thresholds = {"radius": 0.0, "max_axis": 0.0, "aspect": 0.0}
 
         AppState.iteration.subscribe_as(_PLUGIN_OWNER, self._on_iteration_signal)
         AppState.trainer_state.subscribe_as(_PLUGIN_OWNER, self._on_trainer_state_signal)
         AppState.has_trainer.subscribe_as(_PLUGIN_OWNER, self._on_has_trainer_signal)
+
+    def save_settings(self):
+        save_persistent_settings(self.settings)
 
     def _request_redraw(self):
         try:
@@ -97,30 +103,144 @@ class ObjectConstraintPruner:
         p = max(1e-6, min(1.0 - 1e-6, float(p)))
         return math.log(p / (1.0 - p))
 
-    def _set_opacity_target(self, model, kill_mask, target_opacity: float):
+    def _current_total_iterations(self) -> int:
+        try:
+            total = int(lf.trainer_total_iterations())
+            if total > 0:
+                return total
+        except Exception:
+            pass
+        return max(1, int(self.last_seen_iteration) + 1)
+
+    def _current_iteration(self) -> int:
+        try:
+            return int(lf.trainer_current_iteration())
+        except Exception:
+            return int(AppState.iteration.value)
+
+    def _lerp(self, start: float, end: float, t: float) -> float:
+        t = max(0.0, min(1.0, float(t)))
+        return float(start) + (float(end) - float(start)) * t
+
+    def _progress_ratio(self, iteration: int) -> float:
+        total = self._current_total_iterations()
+        if total <= 1:
+            return 1.0
+        return max(0.0, min(1.0, float(iteration) / float(total - 1)))
+
+    def current_thresholds(self, iteration: int | None = None) -> dict[str, float]:
+        iteration = self._current_iteration() if iteration is None else int(iteration)
+        progress = self._progress_ratio(iteration)
+        thresholds = {
+            "radius": self._lerp(self.settings.radius_start, self.settings.radius_end, progress),
+            "max_axis": self._lerp(self.settings.max_axis_start, self.settings.max_axis_end, progress),
+            "aspect": self._lerp(self.settings.max_aspect_start, self.settings.max_aspect_end, progress),
+        }
+        thresholds["radius"] = max(0.0, thresholds["radius"])
+        thresholds["max_axis"] = max(0.0, thresholds["max_axis"])
+        thresholds["aspect"] = max(1.0, thresholds["aspect"])
+        self.last_thresholds = thresholds
+        return thresholds
+
+    def _set_opacity_target(self, model, mask, target_opacity: float):
         raw_target = self._to_logit(target_opacity)
 
         try:
             raw = model.opacity_raw
-            mask = kill_mask.unsqueeze(1)
-            updated = raw.clone().masked_fill(mask, raw_target)
+            cond = mask.unsqueeze(1)
+            updated = lf.Tensor.where(cond, raw_target, raw)
             return self._assign_tensor(raw, updated)
         except Exception as exc:
             self._set_status(f"Opacity update failed: {exc}", level="warn")
             return False
 
-    def _multiply_scale_on_mask(self, model, kill_mask, multiplier: float):
+    def _largest_axis_columns(self, raw_scaling):
+        raw_max = self._reduce_values(raw_scaling.max(dim=1))
+        return raw_scaling >= (raw_max.unsqueeze(1) - 1e-8)
+
+    def _multiply_scale_on_mask(self, model, mask, multiplier: float, scope: str):
         multiplier = max(1e-6, min(1.0, float(multiplier)))
         delta_raw = math.log(multiplier)
 
         try:
             raw = model.scaling_raw
-            mask_f = kill_mask.unsqueeze(1).to(raw.dtype)
-            updated = raw + (mask_f * delta_raw)
+            if scope == "all_axes":
+                cond = mask.unsqueeze(1)
+            else:
+                largest_cols = self._largest_axis_columns(raw)
+                cond = mask.unsqueeze(1) & largest_cols
+            updated = lf.Tensor.where(cond, raw + delta_raw, raw)
             return self._assign_tensor(raw, updated)
         except Exception as exc:
             self._set_status(f"Scale update failed: {exc}", level="warn")
             return False
+
+    def _shrink_aspect_to_threshold(self, model, mask, max_aspect: float, scope: str, multiplier: float):
+        max_aspect = max(1.0, float(max_aspect))
+        multiplier = max(1e-6, min(1.0, float(multiplier)))
+        target_delta = math.log(max_aspect)
+        try:
+            raw = model.scaling_raw
+            updated = raw.clone()
+            if scope == "all_axes":
+                updated = updated + (mask.unsqueeze(1).to(updated.dtype) * math.log(multiplier))
+            raw_max = self._reduce_values(updated.max(dim=1))
+            raw_min = self._reduce_values(updated.min(dim=1))
+            target_raw_max = raw_min + target_delta
+            largest_cols = updated >= (raw_max.unsqueeze(1) - 1e-8)
+            corrected = lf.Tensor.where(
+                largest_cols,
+                lf.Tensor.minimum(updated, target_raw_max.unsqueeze(1)),
+                updated,
+            )
+            final = lf.Tensor.where(mask.unsqueeze(1), corrected, raw)
+            return self._assign_tensor(raw, final)
+        except Exception as exc:
+            self._set_status(f"Aspect shrink failed: {exc}", level="warn")
+            return False
+
+    def _soft_delete(self, model, mask):
+        try:
+            model.soft_delete(mask)
+            return True
+        except Exception as exc:
+            self._set_status(f"Delete action failed: {exc}", level="warn")
+            return False
+
+    def _move_toward_center(self, model, mask, keep_ratio: float = 0.05):
+        if self.center_xyz is None:
+            self.capture_center_from_scene(force=True)
+        if self.center_xyz is None:
+            self._set_status("Move action needs a valid center.", level="warn")
+            return False
+        keep_ratio = max(0.0, min(1.0, float(keep_ratio)))
+        try:
+            cx, cy, cz = self.center_xyz
+            means = model.means_raw
+            center_tensor = lf.Tensor.full([int(model.num_points), 3], 0.0, device=means.device, dtype=means.dtype)
+            center_tensor[:, 0] = cx
+            center_tensor[:, 1] = cy
+            center_tensor[:, 2] = cz
+            near_center = center_tensor + ((means - center_tensor) * keep_ratio)
+            cond = mask.unsqueeze(1)
+            updated = lf.Tensor.where(cond, near_center, means)
+            return self._assign_tensor(means, updated)
+        except Exception as exc:
+            self._set_status(f"Move action failed: {exc}", level="warn")
+            return False
+
+    def _alive_mask(self, model):
+        try:
+            if hasattr(model, "has_deleted_mask") and model.has_deleted_mask():
+                return model.deleted == False
+        except Exception:
+            pass
+        return None
+
+    def _masked_count(self, mask) -> int:
+        if mask is None:
+            return 0
+        return int(mask.sum().item())
 
     def _on_has_trainer_signal(self, has_trainer: bool):
         if not has_trainer:
@@ -133,23 +253,9 @@ class ObjectConstraintPruner:
 
     def _on_iteration_signal(self, iteration: int):
         try:
-            iteration = int(iteration)
-            self.last_seen_iteration = iteration
-
-            if not AppState.is_training.value:
-                self._set_status(f"Trainer state: {AppState.trainer_state.value}")
-                self._request_redraw()
-                return
-
-            if self.pending_manual_prune:
-                self.pending_manual_prune = False
-                self.prune_once(manual_trigger=True, forced_iteration=iteration)
-                self._request_redraw()
-                return
-
-            self.prune_once(manual_trigger=False, forced_iteration=iteration)
+            self.last_seen_iteration = int(iteration)
+            self.current_thresholds(self.last_seen_iteration)
             self._request_redraw()
-
         except Exception as exc:
             self._set_status(f"Iteration signal failed: {exc}", level="error")
             self._request_redraw()
@@ -162,6 +268,7 @@ class ObjectConstraintPruner:
         self.last_counts = {"radius": 0, "max_axis": 0, "aspect": 0}
         self.last_actions = []
         self.pending_manual_prune = False
+        self.current_thresholds(0)
 
         scene = lf.get_scene()
         model = scene.combined_model() if scene is not None else None
@@ -188,6 +295,25 @@ class ObjectConstraintPruner:
                 )
 
         self._request_redraw()
+
+    def on_post_step(self, *args, **kwargs):
+        del args, kwargs
+        try:
+            if not AppState.is_training.value:
+                return
+            iteration = self._current_iteration()
+            self.last_seen_iteration = iteration
+
+            if self.pending_manual_prune:
+                self.pending_manual_prune = False
+                self.prune_once(manual_trigger=True, forced_iteration=iteration)
+            else:
+                self.prune_once(manual_trigger=False, forced_iteration=iteration)
+
+            self._request_redraw()
+        except Exception as exc:
+            self._set_status(f"Post-step callback failed: {exc}", level="error")
+            self._request_redraw()
 
     def on_training_end(self):
         self.pending_manual_prune = False
@@ -228,13 +354,13 @@ class ObjectConstraintPruner:
     def request_manual_prune(self):
         if AppState.is_training.value:
             self.pending_manual_prune = True
-            self._set_status("Manual suppression queued for next iteration.")
+            self._set_status("Manual suppression queued for next training step.")
             self._request_redraw()
             return 0
 
         out = self.prune_once(
             manual_trigger=True,
-            forced_iteration=int(AppState.iteration.value),
+            forced_iteration=self._current_iteration(),
         )
         self._request_redraw()
         return out
@@ -258,9 +384,9 @@ class ObjectConstraintPruner:
                 scene.notify_changed()
             except Exception:
                 pass
-            self._set_status("Cleared old deleted mask on combined_model.")
+            self._set_status("Cleared soft-delete mask on combined_model.")
         else:
-            self._set_status("Failed to clear old deleted mask on combined_model.", level="warn")
+            self._set_status("Failed to clear soft-delete mask on combined_model.", level="warn")
 
         self._request_redraw()
         return ok
@@ -270,7 +396,8 @@ class ObjectConstraintPruner:
         self.last_removed = 0
         self.last_actions = []
 
-        iteration = int(forced_iteration if forced_iteration is not None else AppState.iteration.value)
+        iteration = int(forced_iteration if forced_iteration is not None else self._current_iteration())
+        thresholds = self.current_thresholds(iteration)
 
         if not bool(s.enabled) and not manual_trigger:
             self._set_status("Plugin is disabled.")
@@ -315,31 +442,77 @@ class ObjectConstraintPruner:
         elif self.center_xyz is None:
             self.capture_center_from_scene(force=True)
 
-        kill_mask, counts = self._build_kill_mask(model)
+        matches, counts = self._build_condition_masks(model, thresholds)
         self.last_counts = counts
 
-        if kill_mask is None:
+        if matches is None:
             self._set_status("No match criteria are enabled.")
             return 0
 
-        affected = int(kill_mask.sum().item())
-        if affected == 0:
+        total_matched = counts["radius"] + counts["max_axis"] + counts["aspect"]
+        if total_matched == 0:
             self.last_pruned_iteration = iteration
             self._set_status(
-                f"iter={iteration}: matched 0 "
-                f"(radius={counts['radius']}, max_axis={counts['max_axis']}, aspect={counts['aspect']})"
+                f"iter={iteration}: matched 0 (radius={counts['radius']}, max_axis={counts['max_axis']}, aspect={counts['aspect']})"
             )
             return 0
 
-        actions = []
+        actions_taken: list[str] = []
+        affected_union = None
         try:
-            if bool(s.fade_matched):
-                if self._set_opacity_target(model, kill_mask, float(s.opacity_target)):
-                    actions.append(f"opacity->{float(s.opacity_target):.3f}")
+            for rule_name, action_name in (
+                ("radius", s.radius_action),
+                ("max_axis", s.max_axis_action),
+                ("aspect", s.aspect_action),
+            ):
+                rule_mask = matches[rule_name]
+                if self._masked_count(rule_mask) == 0 or action_name != "delete":
+                    continue
+                if self._soft_delete(model, rule_mask):
+                    actions_taken.append(f"{rule_name}:delete")
+                    affected_union = rule_mask if affected_union is None else (affected_union | rule_mask)
 
-            if bool(s.shrink_matched):
-                if self._multiply_scale_on_mask(model, kill_mask, float(s.scale_multiplier)):
-                    actions.append(f"scale*={float(s.scale_multiplier):.3f}")
+            for rule_name, action_name in (
+                ("radius", s.radius_action),
+                ("max_axis", s.max_axis_action),
+                ("aspect", s.aspect_action),
+            ):
+                rule_mask = matches[rule_name]
+                if self._masked_count(rule_mask) == 0 or action_name == "delete":
+                    continue
+
+                ok = False
+                if action_name == "fade":
+                    ok = self._set_opacity_target(model, rule_mask, float(s.opacity_target))
+                elif action_name == "move":
+                    ok = self._move_toward_center(model, rule_mask)
+                elif action_name == "shrink":
+                    if rule_name == "aspect":
+                        ok = self._shrink_aspect_to_threshold(
+                            model,
+                            rule_mask,
+                            thresholds["aspect"],
+                            str(s.aspect_scale_scope),
+                            float(s.scale_multiplier),
+                        )
+                    elif rule_name == "max_axis":
+                        ok = self._multiply_scale_on_mask(
+                            model,
+                            rule_mask,
+                            float(s.scale_multiplier),
+                            str(s.max_axis_scale_scope),
+                        )
+                    else:
+                        ok = self._multiply_scale_on_mask(
+                            model,
+                            rule_mask,
+                            float(s.scale_multiplier),
+                            str(s.radius_scale_scope),
+                        )
+
+                if ok:
+                    actions_taken.append(f"{rule_name}:{action_name}")
+                    affected_union = rule_mask if affected_union is None else (affected_union | rule_mask)
 
             try:
                 scene.notify_changed()
@@ -356,50 +529,63 @@ class ObjectConstraintPruner:
             self._set_status(f"Suppression failed: {exc}", level="error")
             return 0
 
+        affected = self._masked_count(affected_union)
         self.last_removed = affected
         self.total_removed += affected
         self.last_pruned_iteration = iteration
-        self.last_actions = actions
+        self.last_actions = actions_taken
 
         prefix = "manual" if manual_trigger else f"iter={iteration}"
-        if not actions:
+        if not actions_taken:
             self._set_status(
-                f"{prefix}: matched={affected}, but no suppression action is enabled."
+                f"{prefix}: matched radius={counts['radius']}, max_axis={counts['max_axis']}, aspect={counts['aspect']}, but no actions were applied."
             )
             return affected
 
         self._set_status(
             f"{prefix}: affected={affected} "
-            f"(radius={counts['radius']}, max_axis={counts['max_axis']}, aspect={counts['aspect']}); "
-            f"actions={', '.join(actions)}"
+            f"(radius={counts['radius']}, max_axis={counts['max_axis']}, aspect={counts['aspect']}; "
+            f"thr_radius={thresholds['radius']:.4f}, thr_max_axis={thresholds['max_axis']:.6f}, thr_aspect={thresholds['aspect']:.4f}); "
+            f"actions={', '.join(actions_taken)}"
         )
         return affected
 
-    def _build_kill_mask(self, model):
+    def _build_condition_masks(self, model, thresholds: dict[str, float]):
         n = int(model.num_points)
         if n <= 0:
             return None, {"radius": 0, "max_axis": 0, "aspect": 0}
 
         any_rule = False
-        kill = lf.Tensor.zeros([n], dtype="bool", device="cuda")
         counts = {"radius": 0, "max_axis": 0, "aspect": 0}
+        alive = self._alive_mask(model)
+        false_mask = lf.Tensor.zeros([n], dtype="bool", device="cuda")
+        matches: dict[str, Any] = {
+            "radius": false_mask.clone(),
+            "max_axis": false_mask.clone(),
+            "aspect": false_mask.clone(),
+        }
 
         if bool(self.settings.enable_max_axis) or bool(self.settings.enable_aspect):
-            any_rule = True
             scaling = model.get_scaling()
             max_axis = self._reduce_values(scaling.max(dim=1))
             min_axis = self._reduce_values(scaling.min(dim=1))
 
             if bool(self.settings.enable_max_axis):
-                big_mask = max_axis > float(self.settings.max_axis)
-                counts["max_axis"] = int(big_mask.sum().item())
-                kill = kill | big_mask
+                any_rule = True
+                big_mask = max_axis > float(thresholds["max_axis"])
+                if alive is not None:
+                    big_mask = big_mask & alive
+                matches["max_axis"] = big_mask
+                counts["max_axis"] = self._masked_count(big_mask)
 
             if bool(self.settings.enable_aspect):
+                any_rule = True
                 aspect = max_axis / (min_axis + _EPS)
-                stretch_mask = aspect > float(self.settings.max_aspect)
-                counts["aspect"] = int(stretch_mask.sum().item())
-                kill = kill | stretch_mask
+                stretch_mask = aspect > float(thresholds["aspect"])
+                if alive is not None:
+                    stretch_mask = stretch_mask & alive
+                matches["aspect"] = stretch_mask
+                counts["aspect"] = self._masked_count(stretch_mask)
 
         if bool(self.settings.enable_radius):
             any_rule = True
@@ -411,19 +597,18 @@ class ObjectConstraintPruner:
             else:
                 cx, cy, cz = self.center_xyz
                 means = model.means_raw
-
                 dx = means[:, 0] - cx
                 dy = means[:, 1] - cy
                 dz = means[:, 2] - cz
-
                 dist2 = dx * dx + dy * dy + dz * dz
-                radius2 = float(self.settings.radius * self.settings.radius)
-
+                radius2 = float(thresholds["radius"] * thresholds["radius"])
                 far_mask = dist2 > radius2
-                counts["radius"] = int(far_mask.sum().item())
-                kill = kill | far_mask
+                if alive is not None:
+                    far_mask = far_mask & alive
+                matches["radius"] = far_mask
+                counts["radius"] = self._masked_count(far_mask)
 
         if not any_rule:
             return None, counts
 
-        return kill, counts
+        return matches, counts

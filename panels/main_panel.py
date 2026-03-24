@@ -1,14 +1,21 @@
 import lichtfeld as lf
 from lfs_plugins.ui.state import AppState
 
-from ..settings import GuardSettings
 from ..pruner import get_pruner
+from ..settings import (
+    ACTION_ITEMS,
+    CENTER_MODE_ITEMS,
+    GuardSettings,
+    SCALE_SCOPE_ITEMS,
+    load_persistent_settings,
+    save_persistent_settings,
+)
 
 
 class ObjectConstraintPanel(lf.ui.Panel):
-    id = "object_constraint_guard.panel"
-    label = "Object Constraint Guard"
-    parent = "lfs.training"
+    id = "Lumi_GS_pruning.panel"
+    label = "Lumi GS pruning"
+    space = lf.ui.PanelSpace.MAIN_PANEL_TAB
     order = 220
     update_interval_ms = 250
     poll_dependencies = {
@@ -16,19 +23,10 @@ class ObjectConstraintPanel(lf.ui.Panel):
         lf.ui.PollDependency.TRAINING,
     }
 
-    def __init__(self):
-        self._warmup_step = 10
-        self._radius_step = 0.1
-        self._max_axis_step = 0.01
-        self._max_aspect_step = 1.0
-        self._center_step = 0.05
-        self._opacity_step = 0.01
-        self._scale_mult_step = 0.05
-
     @classmethod
     def poll(cls, context) -> bool:
         del context
-        return AppState.has_scene.value or AppState.has_trainer.value
+        return True
 
     def _redraw(self):
         try:
@@ -39,214 +37,140 @@ class ObjectConstraintPanel(lf.ui.Panel):
     def on_update(self):
         self._redraw()
 
-    def _clamp(self, value, lo, hi):
-        return max(lo, min(hi, value))
-
-    def _nudge_int(self, settings, attr, delta, lo, hi):
-        current = int(getattr(settings, attr))
-        setattr(settings, attr, int(self._clamp(current + delta, lo, hi)))
+    def _save(self, settings):
+        save_persistent_settings(settings)
         self._redraw()
 
-    def _nudge_float(self, settings, attr, delta, lo, hi):
-        current = float(getattr(settings, attr))
-        setattr(settings, attr, float(self._clamp(current + delta, lo, hi)))
-        self._redraw()
+    def _draw_bool(self, layout, settings, attr: str, label: str):
+        changed, value = layout.checkbox(label, bool(getattr(settings, attr)))
+        if changed:
+            setattr(settings, attr, bool(value))
+            self._save(settings)
 
-    def _nudge_center(self, settings, axis_index, delta):
+    def _draw_input_int(self, layout, settings, attr: str, label: str, step: int = 1, step_fast: int = 100):
+        changed, value = layout.input_int(label, int(getattr(settings, attr)), step=step, step_fast=step_fast)
+        if changed:
+            setattr(settings, attr, int(value))
+            self._save(settings)
+
+    def _draw_input_float(self, layout, settings, attr: str, label: str, step: float = 0.0, step_fast: float = 0.0, fmt: str = "%.4f"):
+        changed, value = layout.input_float(label, float(getattr(settings, attr)), step=step, step_fast=step_fast, format=fmt)
+        if changed:
+            setattr(settings, attr, float(value))
+            self._save(settings)
+
+    def _draw_combo(self, layout, settings, attr: str, label: str, items):
+        ids = [item[0] for item in items]
+        labels = [item[1] for item in items]
+        current_value = str(getattr(settings, attr))
+        try:
+            current_idx = ids.index(current_value)
+        except ValueError:
+            current_idx = 0
+        changed, new_idx = layout.combo(label, current_idx, labels)
+        if changed:
+            setattr(settings, attr, ids[int(new_idx)])
+            self._save(settings)
+
+    def _draw_center_inputs(self, layout, settings):
+        layout.label("Center XYZ")
         center = list(settings.center)
-        center[axis_index] = float(self._clamp(center[axis_index] + delta, -100.0, 100.0))
-        settings.center = tuple(center)
-        self._redraw()
+        changed_any = False
+        for idx, axis in enumerate(("X", "Y", "Z")):
+            changed, value = layout.input_float(f"{axis}##center_{axis.lower()}", float(center[idx]), step=0.0, step_fast=0.0, format="%.6f")
+            if changed:
+                center[idx] = float(value)
+                changed_any = True
+        if changed_any:
+            settings.center = tuple(center)
+            self._save(settings)
 
-    def _draw_bool(self, layout, label, value):
-        _, new_value = layout.checkbox(label, bool(value))
-        return bool(new_value)
-
-    def _draw_stepper_int(self, layout, label, value, minus_id, plus_id, step):
-        scale = layout.get_dpi_scale()
-        layout.label(f"{label}: {int(value)}")
-        if layout.button(f"-##{minus_id}", (26 * scale, 0)):
-            return -step
-        layout.same_line()
-        if layout.button(f"+##{plus_id}", (26 * scale, 0)):
-            return step
-        return 0
-
-    def _draw_stepper_float(self, layout, label, value, minus_id, plus_id, step, digits=4):
-        scale = layout.get_dpi_scale()
-        layout.label(f"{label}: {value:.{digits}f}")
-        if layout.button(f"-##{minus_id}", (26 * scale, 0)):
-            return -step
-        layout.same_line()
-        if layout.button(f"+##{plus_id}", (26 * scale, 0)):
-            return step
-        return 0.0
+    def _draw_rule_block(self, layout, settings, title: str, enable_attr: str, start_attr: str, end_attr: str, action_attr: str, scope_attr: str, start_label: str, end_label: str, fmt: str):
+        layout.separator()
+        self._draw_bool(layout, settings, enable_attr, title)
+        self._draw_combo(layout, settings, action_attr, f"Action##{action_attr}", ACTION_ITEMS)
+        self._draw_combo(layout, settings, scope_attr, f"Scale scope##{scope_attr}", SCALE_SCOPE_ITEMS)
+        self._draw_input_float(layout, settings, start_attr, start_label, step=0.0, step_fast=0.0, fmt=fmt)
+        self._draw_input_float(layout, settings, end_attr, end_label, step=0.0, step_fast=0.0, fmt=fmt)
 
     def draw(self, layout):
         settings = GuardSettings.get_instance()
         guard = get_pruner()
         scale = layout.get_dpi_scale()
 
-        layout.label("Training-time gaussian suppression")
-        layout.label(f"Trainer state: {AppState.trainer_state.value}")
-        layout.label(f"AppState iteration: {int(AppState.iteration.value)}")
-        layout.label(f"AppState is_training: {bool(AppState.is_training.value)}")
-
-        if not AppState.has_scene.value:
-            layout.text_colored("No scene loaded yet.", (1.0, 0.75, 0.4, 1.0))
-        if not AppState.has_trainer.value:
-            layout.text_colored(
-                "No trainer active. Manual actions still need a scene/model.",
-                (0.7, 0.7, 0.7, 1.0),
-            )
-
-        layout.text_colored(
-            "This build uses the same AppState iteration signal path as your working pruning version.",
-            (0.75, 0.90, 1.0, 1.0),
-        )
+        self._draw_bool(layout, settings, "enabled", "Enabled")
+        self._draw_bool(layout, settings, "log_each_hit", "Log updates")
+        self._draw_input_int(layout, settings, "warmup_iters", "Warmup iterations", step=1, step_fast=100)
+        self._draw_input_int(layout, settings, "apply_every", "Apply every N steps", step=1, step_fast=10)
 
         layout.separator()
+        self._draw_combo(layout, settings, "center_mode", "Center mode", CENTER_MODE_ITEMS)
+        self._draw_center_inputs(layout, settings)
 
-        settings.enabled = self._draw_bool(layout, "Enabled", settings.enabled)
-        settings.enable_radius = self._draw_bool(layout, "Match outside radius", settings.enable_radius)
-        settings.enable_max_axis = self._draw_bool(layout, "Match oversized Gaussians", settings.enable_max_axis)
-        settings.enable_aspect = self._draw_bool(layout, "Match stretched Gaussians", settings.enable_aspect)
-        settings.fade_matched = self._draw_bool(layout, "Fade matched", settings.fade_matched)
-        settings.shrink_matched = self._draw_bool(layout, "Shrink matched", settings.shrink_matched)
-        settings.log_each_hit = self._draw_bool(layout, "Log updates", settings.log_each_hit)
-
-        layout.separator()
-
-        delta = self._draw_stepper_int(
+        self._draw_rule_block(
             layout,
-            "Warmup iterations",
-            settings.warmup_iters,
-            "warmup_minus",
-            "warmup_plus",
-            self._warmup_step,
+            settings,
+            "Match outside radius",
+            "enable_radius",
+            "radius_start",
+            "radius_end",
+            "radius_action",
+            "radius_scale_scope",
+            "Radius at start",
+            "Radius at end",
+            "%.6f",
         )
-        if delta != 0:
-            self._nudge_int(settings, "warmup_iters", delta, 0, 10000)
 
-        delta = self._draw_stepper_int(
+        self._draw_rule_block(
             layout,
-            "Apply every N steps",
-            settings.apply_every,
-            "apply_minus",
-            "apply_plus",
-            1,
+            settings,
+            "Match oversized Gaussians",
+            "enable_max_axis",
+            "max_axis_start",
+            "max_axis_end",
+            "max_axis_action",
+            "max_axis_scale_scope",
+            "Max axis at start",
+            "Max axis at end",
+            "%.6f",
         )
-        if delta != 0:
-            self._nudge_int(settings, "apply_every", delta, 1, 100)
+
+        self._draw_rule_block(
+            layout,
+            settings,
+            "Match stretched Gaussians",
+            "enable_aspect",
+            "max_aspect_start",
+            "max_aspect_end",
+            "aspect_action",
+            "aspect_scale_scope",
+            "Max aspect at start",
+            "Max aspect at end",
+            "%.6f",
+        )
 
         layout.separator()
-
-        layout.label(f"Center mode: {'Manual' if settings.center_mode == 'manual' else 'Auto once'}")
-
-        if layout.button("Use auto center##center_auto", (-1, 28 * scale)):
-            settings.center_mode = "auto_once"
-            self._redraw()
-
-        if layout.button("Use manual center##center_manual", (-1, 28 * scale)):
-            settings.center_mode = "manual"
-            self._redraw()
-
-        if settings.center_mode == "manual":
-            layout.separator()
-            layout.label("Manual center XYZ")
-
-            for axis_index, axis_name in enumerate(("X", "Y", "Z")):
-                center_val = float(settings.center[axis_index])
-                layout.label(f"{axis_name}: {center_val:.4f}")
-
-                if layout.button(f"-##{axis_name}_minus", (26 * scale, 0)):
-                    self._nudge_center(settings, axis_index, -self._center_step)
-                layout.same_line()
-                if layout.button(f"+##{axis_name}_plus", (26 * scale, 0)):
-                    self._nudge_center(settings, axis_index, self._center_step)
+        layout.label("Shared action parameters")
+        self._draw_input_float(layout, settings, "opacity_target", "Opacity target", step=0.0, step_fast=0.0, fmt="%.6f")
+        self._draw_input_float(layout, settings, "scale_multiplier", "Scale multiplier", step=0.0, step_fast=0.0, fmt="%.6f")
 
         layout.separator()
-
-        if settings.enable_radius:
-            delta = self._draw_stepper_float(
-                layout,
-                "Radius",
-                float(settings.radius),
-                "radius_minus",
-                "radius_plus",
-                self._radius_step,
-                digits=3,
-            )
-            if delta != 0.0:
-                self._nudge_float(settings, "radius", delta, 0.0, 50.0)
-
-        if settings.enable_max_axis:
-            delta = self._draw_stepper_float(
-                layout,
-                "Max axis scale",
-                float(settings.max_axis),
-                "axis_minus",
-                "axis_plus",
-                self._max_axis_step,
-                digits=4,
-            )
-            if delta != 0.0:
-                self._nudge_float(settings, "max_axis", delta, 0.0, 10.0)
-
-        if settings.enable_aspect:
-            delta = self._draw_stepper_float(
-                layout,
-                "Max aspect ratio",
-                float(settings.max_aspect),
-                "aspect_minus",
-                "aspect_plus",
-                self._max_aspect_step,
-                digits=2,
-            )
-            if delta != 0.0:
-                self._nudge_float(settings, "max_aspect", delta, 1.0, 1000.0)
-
-        layout.separator()
-
-        if settings.fade_matched:
-            delta = self._draw_stepper_float(
-                layout,
-                "Opacity target",
-                float(settings.opacity_target),
-                "opacity_minus",
-                "opacity_plus",
-                self._opacity_step,
-                digits=3,
-            )
-            if delta != 0.0:
-                self._nudge_float(settings, "opacity_target", delta, 0.001, 1.0)
-
-        if settings.shrink_matched:
-            delta = self._draw_stepper_float(
-                layout,
-                "Scale multiplier",
-                float(settings.scale_multiplier),
-                "scale_mult_minus",
-                "scale_mult_plus",
-                self._scale_mult_step,
-                digits=3,
-            )
-            if delta != 0.0:
-                self._nudge_float(settings, "scale_multiplier", delta, 0.01, 1.0)
-
-        layout.separator()
-
         if guard is None:
             layout.text_colored("Pruner not initialized.", (1.0, 0.5, 0.5, 1.0))
             return
 
+        thresholds = guard.current_thresholds()
         layout.label(f"Last affected: {guard.last_removed:,}")
         layout.label(f"Total affected: {guard.total_removed:,}")
-        layout.label(f"Last seen iteration signal: {guard.last_seen_iteration}")
+        layout.label(f"Last seen iteration: {guard.last_seen_iteration}")
         layout.label(f"Last applied iteration: {guard.last_pruned_iteration}")
         layout.label(f"Captured center: {guard._fmt_center(guard.center_xyz)}")
         layout.text_colored(
-            f"Last counts: radius={guard.last_counts['radius']}, max_axis={guard.last_counts['max_axis']}, aspect={guard.last_counts['aspect']}",
+            f"Current thresholds -> radius={thresholds['radius']:.6f}, max_axis={thresholds['max_axis']:.6f}, aspect={thresholds['aspect']:.6f}",
+            (0.8, 0.9, 0.8, 1.0),
+        )
+        layout.text_colored(
+            f"Last counts -> radius={guard.last_counts['radius']}, max_axis={guard.last_counts['max_axis']}, aspect={guard.last_counts['aspect']}",
             (0.8, 0.8, 0.8, 1.0),
         )
         actions_text = ", ".join(guard.last_actions) if guard.last_actions else "<none>"
@@ -254,7 +178,6 @@ class ObjectConstraintPanel(lf.ui.Panel):
         layout.text_colored(f"Status: {guard.status_message}", (0.7, 0.9, 1.0, 1.0))
 
         layout.separator()
-
         if layout.button("Capture center now", (-1, 30 * scale)):
             guard.capture_center_from_scene(force=True)
             self._redraw()
@@ -263,38 +186,15 @@ class ObjectConstraintPanel(lf.ui.Panel):
             guard.request_manual_prune()
             self._redraw()
 
-        if layout.button("Clear old soft-delete mask", (-1, 30 * scale)):
+        if layout.button("Clear soft-delete mask", (-1, 30 * scale)):
             guard.clear_old_mask_now()
             self._redraw()
 
         layout.separator()
+        if layout.button("Reload saved settings", (-1, 28 * scale)):
+            load_persistent_settings(settings)
+            self._redraw()
 
-        if layout.collapsing_header("Quick presets", default_open=False):
-            if layout.button("Preset: mild fade", (-1, 28 * scale)):
-                settings.warmup_iters = 0
-                settings.apply_every = 1
-                settings.radius = 0.5
-                settings.max_axis = 0.03
-                settings.max_aspect = 10.0
-                settings.enable_radius = True
-                settings.enable_max_axis = True
-                settings.enable_aspect = True
-                settings.fade_matched = True
-                settings.opacity_target = 0.10
-                settings.shrink_matched = False
-                self._redraw()
-
-            if layout.button("Preset: fade + shrink", (-1, 28 * scale)):
-                settings.warmup_iters = 0
-                settings.apply_every = 1
-                settings.radius = 0.5
-                settings.max_axis = 0.03
-                settings.max_aspect = 10.0
-                settings.enable_radius = True
-                settings.enable_max_axis = True
-                settings.enable_aspect = True
-                settings.fade_matched = True
-                settings.opacity_target = 0.05
-                settings.shrink_matched = True
-                settings.scale_multiplier = 0.50
-                self._redraw()
+        if layout.button("Save settings now", (-1, 28 * scale)):
+            save_persistent_settings(settings)
+            self._redraw()
