@@ -22,13 +22,13 @@ RULE_KEYS = ("radius", "max_axis", "aspect")
 
 ACTION_ITEMS = [
     ("none", "None", "Do not apply any action to matched Gaussians"),
-    ("fade", "Fade", "Set matched Gaussian opacity to the interpolated opacity target"),
+    ("fade", "Fade", "Multiply matched Gaussian opacity by the interpolated opacity multiplier"),
     ("shrink", "Shrink", "Multiply matched Gaussian scale by the interpolated shrink multiplier"),
     ("expand", "Expand", "Multiply matched Gaussian scale by the interpolated expand multiplier"),
     ("clamp", "Clamp", "Clamp matched Gaussian scale down to the interpolated clamp target"),
-    ("fade_shrink", "Fade + Shrink", "Fade opacity and shrink matched Gaussian scale"),
-    ("fade_expand", "Fade + Expand", "Fade opacity and expand matched Gaussian scale"),
-    ("fade_clamp", "Fade + Clamp", "Fade opacity and clamp matched Gaussian scale"),
+    ("fade_shrink", "Fade + Shrink", "Multiply matched Gaussian opacity and shrink matched Gaussian scale"),
+    ("fade_expand", "Fade + Expand", "Multiply matched Gaussian opacity and expand matched Gaussian scale"),
+    ("fade_clamp", "Fade + Clamp", "Multiply matched Gaussian opacity and clamp matched Gaussian scale"),
     ("delete", "Delete", "Soft-delete matched Gaussians"),
     ("move", "Move", "Move matched Gaussians toward the center"),
 ]
@@ -81,8 +81,8 @@ class PhaseSettings(PropertyGroup):
     radius_end = FloatProperty(default=1.0, min=0.0, max=100000.0, step=0.1, precision=6, name="Radius end")
     radius_action = EnumProperty(items=ACTION_ITEMS, default="fade", name="Radius action")
     radius_scale_scope = EnumProperty(items=SCALE_SCOPE_ITEMS, default="largest_axis", name="Radius scale scope")
-    radius_opacity_start = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Radius opacity start")
-    radius_opacity_end = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Radius opacity end")
+    radius_opacity_start = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Radius opacity multiplier start")
+    radius_opacity_end = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Radius opacity multiplier end")
     radius_scale_multiplier_start = FloatProperty(default=0.50, min=0.000001, max=1000000.0, step=0.01, precision=6, name="Radius scale multiplier start")
     radius_scale_multiplier_end = FloatProperty(default=0.50, min=0.000001, max=1000000.0, step=0.01, precision=6, name="Radius scale multiplier end")
     radius_clamp_start = FloatProperty(default=1.0, min=0.000001, max=1000000.0, step=0.01, precision=6, name="Radius clamp start")
@@ -93,8 +93,8 @@ class PhaseSettings(PropertyGroup):
     max_axis_end = FloatProperty(default=0.17, min=0.0, max=100000.0, step=0.01, precision=6, name="Max axis end")
     max_axis_action = EnumProperty(items=ACTION_ITEMS, default="shrink", name="Oversized action")
     max_axis_scale_scope = EnumProperty(items=SCALE_SCOPE_ITEMS, default="largest_axis", name="Oversized scale scope")
-    max_axis_opacity_start = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Oversized opacity start")
-    max_axis_opacity_end = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Oversized opacity end")
+    max_axis_opacity_start = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Oversized opacity multiplier start")
+    max_axis_opacity_end = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Oversized opacity multiplier end")
     max_axis_scale_multiplier_start = FloatProperty(default=0.50, min=0.000001, max=1000000.0, step=0.01, precision=6, name="Oversized scale multiplier start")
     max_axis_scale_multiplier_end = FloatProperty(default=0.50, min=0.000001, max=1000000.0, step=0.01, precision=6, name="Oversized scale multiplier end")
     max_axis_clamp_start = FloatProperty(default=1.0, min=0.000001, max=1000000.0, step=0.01, precision=6, name="Oversized clamp start")
@@ -105,8 +105,8 @@ class PhaseSettings(PropertyGroup):
     max_aspect_end = FloatProperty(default=10.0, min=1.0, max=100000.0, step=0.1, precision=6, name="Max aspect end")
     aspect_action = EnumProperty(items=ACTION_ITEMS, default="shrink", name="Stretch action")
     aspect_scale_scope = EnumProperty(items=SCALE_SCOPE_ITEMS, default="largest_axis", name="Stretch scale scope")
-    aspect_opacity_start = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Stretch opacity start")
-    aspect_opacity_end = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Stretch opacity end")
+    aspect_opacity_start = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Stretch opacity multiplier start")
+    aspect_opacity_end = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Stretch opacity multiplier end")
     aspect_scale_multiplier_start = FloatProperty(default=0.50, min=0.000001, max=1000000.0, step=0.01, precision=6, name="Stretch scale multiplier start")
     aspect_scale_multiplier_end = FloatProperty(default=0.50, min=0.000001, max=1000000.0, step=0.01, precision=6, name="Stretch scale multiplier end")
     aspect_clamp_start = FloatProperty(default=1.0, min=0.000001, max=1000000.0, step=0.01, precision=6, name="Stretch clamp start")
@@ -164,8 +164,8 @@ class GuardSettings(PropertyGroup):
     radius_end = FloatProperty(default=1.0, min=0.0, max=100000.0, step=0.1, precision=6, name="Radius end")
     radius_action = EnumProperty(items=ACTION_ITEMS, default="fade", name="Radius action")
     radius_scale_scope = EnumProperty(items=SCALE_SCOPE_ITEMS, default="largest_axis", name="Radius scale scope")
-    radius_opacity_start = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Radius opacity start")
-    radius_opacity_end = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Radius opacity end")
+    radius_opacity_start = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Radius opacity multiplier start")
+    radius_opacity_end = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Radius opacity multiplier end")
     radius_scale_multiplier_start = FloatProperty(default=0.50, min=0.000001, max=1000000.0, step=0.01, precision=6, name="Radius scale multiplier start")
     radius_scale_multiplier_end = FloatProperty(default=0.50, min=0.000001, max=1000000.0, step=0.01, precision=6, name="Radius scale multiplier end")
     radius_clamp_start = FloatProperty(default=1.0, min=0.000001, max=1000000.0, step=0.01, precision=6, name="Radius clamp start")
@@ -180,8 +180,8 @@ class GuardSettings(PropertyGroup):
     max_axis_end = FloatProperty(default=0.17, min=0.0, max=100000.0, step=0.01, precision=6, name="Max axis end")
     max_axis_action = EnumProperty(items=ACTION_ITEMS, default="shrink", name="Oversized action")
     max_axis_scale_scope = EnumProperty(items=SCALE_SCOPE_ITEMS, default="largest_axis", name="Oversized scale scope")
-    max_axis_opacity_start = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Oversized opacity start")
-    max_axis_opacity_end = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Oversized opacity end")
+    max_axis_opacity_start = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Oversized opacity multiplier start")
+    max_axis_opacity_end = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Oversized opacity multiplier end")
     max_axis_scale_multiplier_start = FloatProperty(default=0.50, min=0.000001, max=1000000.0, step=0.01, precision=6, name="Oversized scale multiplier start")
     max_axis_scale_multiplier_end = FloatProperty(default=0.50, min=0.000001, max=1000000.0, step=0.01, precision=6, name="Oversized scale multiplier end")
     max_axis_clamp_start = FloatProperty(default=1.0, min=0.000001, max=1000000.0, step=0.01, precision=6, name="Oversized clamp start")
@@ -196,8 +196,8 @@ class GuardSettings(PropertyGroup):
     max_aspect_end = FloatProperty(default=10.0, min=1.0, max=100000.0, step=0.1, precision=6, name="Max aspect end")
     aspect_action = EnumProperty(items=ACTION_ITEMS, default="shrink", name="Stretch action")
     aspect_scale_scope = EnumProperty(items=SCALE_SCOPE_ITEMS, default="largest_axis", name="Stretch scale scope")
-    aspect_opacity_start = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Stretch opacity start")
-    aspect_opacity_end = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Stretch opacity end")
+    aspect_opacity_start = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Stretch opacity multiplier start")
+    aspect_opacity_end = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Stretch opacity multiplier end")
     aspect_scale_multiplier_start = FloatProperty(default=0.50, min=0.000001, max=1000000.0, step=0.01, precision=6, name="Stretch scale multiplier start")
     aspect_scale_multiplier_end = FloatProperty(default=0.50, min=0.000001, max=1000000.0, step=0.01, precision=6, name="Stretch scale multiplier end")
     aspect_clamp_start = FloatProperty(default=1.0, min=0.000001, max=1000000.0, step=0.01, precision=6, name="Stretch clamp start")

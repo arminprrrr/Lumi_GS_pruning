@@ -53,7 +53,7 @@ class ObjectConstraintPruner:
         self.last_thresholds = {"radius": 0.0, "max_axis": 0.0, "aspect": 0.0}
         self.last_rule_values = {
             rule: {
-                "opacity": 0.0,
+                "opacity_multiplier": 1.0,
                 "scale_multiplier": 1.0,
                 "clamp_value": 1.0,
                 "action": "none",
@@ -197,7 +197,7 @@ class ObjectConstraintPruner:
             "threshold": threshold,
             "action": str(getattr(source, f"{rule}_action")),
             "scale_scope": str(getattr(source, f"{rule}_scale_scope")),
-            "opacity_target": max(
+            "opacity_multiplier": max(
                 1e-6,
                 min(
                     1.0,
@@ -246,7 +246,7 @@ class ObjectConstraintPruner:
         self.last_thresholds = {rule: rules[rule]["threshold"] for rule in _RULES}
         self.last_rule_values = {
             rule: {
-                "opacity": rules[rule]["opacity_target"],
+                "opacity_multiplier": rules[rule]["opacity_multiplier"],
                 "scale_multiplier": rules[rule]["scale_multiplier"],
                 "clamp_value": rules[rule]["clamp_value"],
                 "action": rules[rule]["action"],
@@ -263,16 +263,40 @@ class ObjectConstraintPruner:
             return dict(self.last_thresholds)
         return dict(self.last_thresholds)
 
-    def _set_opacity_target(self, model, mask, target_opacity: float):
-        raw_target = self._to_logit(target_opacity)
+    def _tensor_log(self, tensor):
+        if hasattr(tensor, "log"):
+            return tensor.log()
+        if hasattr(lf.Tensor, "log"):
+            return lf.Tensor.log(tensor)
+        cpu_np = tensor.cpu().numpy(copy=True)
+        import numpy as np
+        return lf.Tensor.from_numpy(np.log(cpu_np), copy=True).to(tensor.dtype).cuda() if tensor.is_cuda else lf.Tensor.from_numpy(np.log(cpu_np), copy=True).to(tensor.dtype)
+
+    def _tensor_logit(self, tensor):
+        return self._tensor_log(tensor / (1.0 - tensor))
+
+    def _apply_opacity_multiplier(self, model, mask, multiplier: float):
+        multiplier = max(1e-6, min(1.0, float(multiplier)))
+        if abs(multiplier - 1.0) <= 1e-12:
+            return False
 
         try:
+            current = model.get_opacity()
+            target = current * multiplier
+            if hasattr(target, "clamp"):
+                target = target.clamp(1e-6, 1.0 - 1e-6)
+            else:
+                target = lf.Tensor.minimum(target, lf.Tensor.full(list(target.shape), 1.0 - 1e-6, device=target.device, dtype=target.dtype))
+                floor = lf.Tensor.full(list(target.shape), 1e-6, device=target.device, dtype=target.dtype)
+                target = lf.Tensor.where(target < floor, floor, target)
+
+            raw_target = self._tensor_logit(target).unsqueeze(1)
             raw = model.opacity_raw
             cond = mask.unsqueeze(1)
             updated = lf.Tensor.where(cond, raw_target, raw)
             return self._assign_tensor(raw, updated)
         except Exception as exc:
-            self._set_status(f"Opacity update failed: {exc}", level="warn")
+            self._set_status(f"Opacity multiply failed: {exc}", level="warn")
             return False
 
     def _largest_axis_columns(self, raw_scaling):
@@ -296,7 +320,7 @@ class ObjectConstraintPruner:
                 raise ValueError(f"Unknown scale mode: {mode}")
 
             if abs(multiplier - 1.0) <= 1e-12:
-                return True
+                return False
 
             delta_raw = math.log(multiplier)
             cond = self._scale_condition(raw, mask, scope)
@@ -311,8 +335,10 @@ class ObjectConstraintPruner:
         try:
             raw = model.scaling_raw
             clamp_raw = math.log(clamp_value)
-            clamp_tensor = lf.Tensor.full(list(raw.shape), clamp_raw, device=raw.device, dtype=raw.dtype)
             cond = self._scale_condition(raw, mask, scope)
+            if int((cond & (raw > clamp_raw)).any().item()) == 0:
+                return False
+            clamp_tensor = lf.Tensor.full(list(raw.shape), clamp_raw, device=raw.device, dtype=raw.dtype)
             capped = lf.Tensor.minimum(raw, clamp_tensor)
             updated = lf.Tensor.where(cond, capped, raw)
             return self._assign_tensor(raw, updated)
@@ -430,13 +456,14 @@ class ObjectConstraintPruner:
             iteration = self._current_iteration()
             self.last_seen_iteration = iteration
 
-            if self.pending_manual_prune:
+            if not bool(self.settings.enabled):
+                self.pending_manual_prune = False
+                self.current_thresholds(iteration)
+            elif self.pending_manual_prune:
                 self.pending_manual_prune = False
                 self.prune_once(manual_trigger=True, forced_iteration=iteration)
-            elif bool(self.settings.enabled):
-                self.prune_once(manual_trigger=False, forced_iteration=iteration)
             else:
-                self.current_thresholds(iteration)
+                self.prune_once(manual_trigger=False, forced_iteration=iteration)
 
             self._request_redraw()
         except Exception as exc:
@@ -480,6 +507,12 @@ class ObjectConstraintPruner:
         return self.center_xyz
 
     def request_manual_prune(self):
+        if not bool(self.settings.enabled):
+            self.pending_manual_prune = False
+            self._set_status("Plugin is disabled. Manual suppression was ignored.")
+            self._request_redraw()
+            return 0
+
         if AppState.is_training.value:
             self.pending_manual_prune = True
             self._set_status("Manual suppression queued for next training step.")
@@ -524,43 +557,37 @@ class ObjectConstraintPruner:
         if action_name in {"none", "delete"}:
             return False
 
-        ok = True
-        performed = False
+        changed = False
         if action_name in {"fade", "fade_shrink", "fade_expand", "fade_clamp"}:
-            ok = self._set_opacity_target(model, rule_mask, float(rule_cfg["opacity_target"])) and ok
-            performed = True
+            changed = self._apply_opacity_multiplier(model, rule_mask, float(rule_cfg["opacity_multiplier"])) or changed
 
         if action_name in {"shrink", "fade_shrink"}:
-            ok = self._apply_scale_multiplier(
+            changed = self._apply_scale_multiplier(
                 model,
                 rule_mask,
                 float(rule_cfg["scale_multiplier"]),
                 str(rule_cfg["scale_scope"]),
                 mode="shrink",
-            ) and ok
-            performed = True
+            ) or changed
         elif action_name in {"expand", "fade_expand"}:
-            ok = self._apply_scale_multiplier(
+            changed = self._apply_scale_multiplier(
                 model,
                 rule_mask,
                 float(rule_cfg["scale_multiplier"]),
                 str(rule_cfg["scale_scope"]),
                 mode="expand",
-            ) and ok
-            performed = True
+            ) or changed
         elif action_name in {"clamp", "fade_clamp"}:
-            ok = self._apply_scale_clamp(
+            changed = self._apply_scale_clamp(
                 model,
                 rule_mask,
                 float(rule_cfg["clamp_value"]),
                 str(rule_cfg["scale_scope"]),
-            ) and ok
-            performed = True
+            ) or changed
         elif action_name == "move":
-            ok = self._move_toward_center(model, rule_mask) and ok
-            performed = True
+            changed = self._move_toward_center(model, rule_mask) or changed
 
-        return bool(ok and performed)
+        return bool(changed)
 
     def prune_once(self, manual_trigger: bool = False, forced_iteration: int | None = None):
         s = self.settings
@@ -570,7 +597,8 @@ class ObjectConstraintPruner:
         iteration = int(forced_iteration if forced_iteration is not None else self._current_iteration())
         profile = self._current_profile(iteration)
 
-        if not bool(s.enabled) and not manual_trigger:
+        if not bool(s.enabled):
+            self.pending_manual_prune = False
             self._set_status("Plugin is disabled.")
             return 0
 
@@ -700,7 +728,11 @@ class ObjectConstraintPruner:
         any_rule = False
         counts = {"radius": 0, "max_axis": 0, "aspect": 0}
         alive = self._alive_mask(model)
-        false_mask = lf.Tensor.zeros([n], dtype="bool", device="cuda")
+        try:
+            device = model.means_raw.device
+        except Exception:
+            device = "cuda"
+        false_mask = lf.Tensor.zeros([n], dtype="bool", device=device)
         matches: dict[str, Any] = {
             "radius": false_mask.clone(),
             "max_axis": false_mask.clone(),

@@ -103,8 +103,8 @@ class ObjectConstraintPanel(lf.ui.Panel):
         self._draw_combo(layout, settings, f"{rule_prefix}_scale_scope", f"Scale scope##{rule_prefix}", SCALE_SCOPE_ITEMS)
         self._draw_input_float(layout, settings, threshold_start_attr, start_label, step=0.0, step_fast=0.0, fmt=fmt)
         self._draw_input_float(layout, settings, threshold_end_attr, end_label, step=0.0, step_fast=0.0, fmt=fmt)
-        self._draw_input_float(layout, settings, f"{rule_prefix}_opacity_start", f"Opacity start##{rule_prefix}", step=0.0, step_fast=0.0, fmt="%.6f")
-        self._draw_input_float(layout, settings, f"{rule_prefix}_opacity_end", f"Opacity end##{rule_prefix}", step=0.0, step_fast=0.0, fmt="%.6f")
+        self._draw_input_float(layout, settings, f"{rule_prefix}_opacity_start", f"Opacity multiplier start##{rule_prefix}", step=0.0, step_fast=0.0, fmt="%.6f")
+        self._draw_input_float(layout, settings, f"{rule_prefix}_opacity_end", f"Opacity multiplier end##{rule_prefix}", step=0.0, step_fast=0.0, fmt="%.6f")
         self._draw_input_float(layout, settings, f"{rule_prefix}_scale_multiplier_start", f"Scale multiplier start##{rule_prefix}", step=0.0, step_fast=0.0, fmt="%.6f")
         self._draw_input_float(layout, settings, f"{rule_prefix}_scale_multiplier_end", f"Scale multiplier end##{rule_prefix}", step=0.0, step_fast=0.0, fmt="%.6f")
         self._draw_input_float(layout, settings, f"{rule_prefix}_clamp_start", f"Clamp scale start##{rule_prefix}", step=0.0, step_fast=0.0, fmt="%.6f")
@@ -263,15 +263,15 @@ class ObjectConstraintPanel(lf.ui.Panel):
             (0.8, 0.9, 0.8, 1.0),
         )
         layout.text_colored(
-            f"Current params -> radius[action={guard.last_rule_values['radius']['action']}, opacity={guard.last_rule_values['radius']['opacity']:.4f}, mult={guard.last_rule_values['radius']['scale_multiplier']:.4f}, clamp={guard.last_rule_values['radius']['clamp_value']:.4f}]",
+            f"Current params -> radius[action={guard.last_rule_values['radius']['action']}, opacity_mult={guard.last_rule_values['radius']['opacity_multiplier']:.4f}, mult={guard.last_rule_values['radius']['scale_multiplier']:.4f}, clamp={guard.last_rule_values['radius']['clamp_value']:.4f}]",
             (0.8, 0.8, 0.95, 1.0),
         )
         layout.text_colored(
-            f"Current params -> max_axis[action={guard.last_rule_values['max_axis']['action']}, opacity={guard.last_rule_values['max_axis']['opacity']:.4f}, mult={guard.last_rule_values['max_axis']['scale_multiplier']:.4f}, clamp={guard.last_rule_values['max_axis']['clamp_value']:.4f}]",
+            f"Current params -> max_axis[action={guard.last_rule_values['max_axis']['action']}, opacity_mult={guard.last_rule_values['max_axis']['opacity_multiplier']:.4f}, mult={guard.last_rule_values['max_axis']['scale_multiplier']:.4f}, clamp={guard.last_rule_values['max_axis']['clamp_value']:.4f}]",
             (0.8, 0.8, 0.95, 1.0),
         )
         layout.text_colored(
-            f"Current params -> aspect[action={guard.last_rule_values['aspect']['action']}, opacity={guard.last_rule_values['aspect']['opacity']:.4f}, mult={guard.last_rule_values['aspect']['scale_multiplier']:.4f}, clamp={guard.last_rule_values['aspect']['clamp_value']:.4f}]",
+            f"Current params -> aspect[action={guard.last_rule_values['aspect']['action']}, opacity_mult={guard.last_rule_values['aspect']['opacity_multiplier']:.4f}, mult={guard.last_rule_values['aspect']['scale_multiplier']:.4f}, clamp={guard.last_rule_values['aspect']['clamp_value']:.4f}]",
             (0.8, 0.8, 0.95, 1.0),
         )
         layout.text_colored(
