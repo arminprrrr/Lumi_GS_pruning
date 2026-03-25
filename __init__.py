@@ -1,6 +1,10 @@
 import lichtfeld as lf
 
-from .panels.main_panel import ObjectConstraintPanel
+try:
+    from .panels.main_panel import ObjectConstraintPanel
+except Exception:
+    from .main_panel import ObjectConstraintPanel
+
 from .pruner import install_pruner, uninstall_pruner
 from .settings import GuardSettings, initialize_runtime_settings
 
@@ -15,7 +19,6 @@ def on_load():
 
     install_pruner()
     lf.log.info("Lumi_GS_pruning loaded")
-
 
 
 def on_unload():
