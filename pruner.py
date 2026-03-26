@@ -22,12 +22,30 @@ def get_pruner():
     return _PRUNER
 
 
+def _dispatch_training_start(*args, **kwargs):
+    if _PRUNER is not None:
+        return _PRUNER.on_training_start(*args, **kwargs)
+    return None
+
+
+def _dispatch_post_step(*args, **kwargs):
+    if _PRUNER is not None:
+        return _PRUNER.on_post_step(*args, **kwargs)
+    return None
+
+
+def _dispatch_training_end(*args, **kwargs):
+    if _PRUNER is not None:
+        return _PRUNER.on_training_end(*args, **kwargs)
+    return None
+
+
 def install_pruner():
     global _PRUNER
     _PRUNER = ObjectConstraintPruner()
-    lf.on_training_start(_PRUNER.on_training_start)
-    lf.on_post_step(_PRUNER.on_post_step)
-    lf.on_training_end(_PRUNER.on_training_end)
+    lf.on_training_start(_dispatch_training_start)
+    lf.on_post_step(_dispatch_post_step)
+    lf.on_training_end(_dispatch_training_end)
 
 
 def uninstall_pruner():
@@ -289,7 +307,8 @@ class ObjectConstraintPruner:
             self._set_status(f"Iteration signal failed: {exc}", level="error")
             self._request_redraw()
 
-    def on_training_start(self):
+    def on_training_start(self, *args, **kwargs):
+        del args, kwargs
         self.last_removed = 0
         self.total_removed = 0
         self.last_seen_iteration = -1
@@ -340,7 +359,8 @@ class ObjectConstraintPruner:
             self._set_status(f"Post-step callback failed: {exc}", level="error")
             self._request_redraw()
 
-    def on_training_end(self):
+    def on_training_end(self, *args, **kwargs):
+        del args, kwargs
         self.pending_manual_prune = False
         self._set_status("Training ended.")
         self._request_redraw()

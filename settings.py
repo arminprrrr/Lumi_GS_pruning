@@ -20,6 +20,11 @@ PERSIST_KEY = "guard_settings_v4_json"
 LEGACY_PERSIST_KEYS = ("guard_settings_v4_json", "guard_settings_v3_json", "guard_settings_v2_json")
 LOCAL_PERSIST_PATH = Path(__file__).with_name("guard_settings.json")
 
+PLUGIN_CONFIG_SECTION_KEYS = ("lumi_gs_pruning", "lumi_guard", "lumi_gs_pruning_settings", "lumi_guard_settings")
+PLUGIN_CONFIG_CONTAINER_KEYS = ("plugins", "plugin_configs", "plugin_settings")
+HOST_CONFIG_SIDECAR_SUFFIXES = (".lumi_gs_pruning.json", ".lumi_guard.json", ".plugin.json")
+_LAST_RUNTIME_INIT_REPORT: dict[str, Any] = {}
+
 ACTION_ITEMS = [
     ("none", "None", "Do not apply any action to matched Gaussians"),
     ("fade", "Fade", "Multiply matched Gaussian opacity by the interpolated opacity multiplier"),
@@ -253,6 +258,216 @@ def _store_set(store, key: str, value):
 
 
 
+def _json_key_lookup(data: dict[str, Any]) -> dict[str, str]:
+    return {str(key).strip().lower(): key for key in data.keys() if isinstance(key, str)}
+
+
+def _normalize_config_blob(data: Any) -> tuple[dict[str, Any], str]:
+    if not isinstance(data, dict):
+        raise ValueError("Plugin config payload must be a JSON object")
+    key_lookup = _json_key_lookup(data)
+    for logical_key in PLUGIN_CONFIG_SECTION_KEYS:
+        actual_key = key_lookup.get(logical_key)
+        if actual_key is None:
+            continue
+        section = data.get(actual_key)
+        if isinstance(section, dict):
+            return section, actual_key
+    for logical_key in PLUGIN_CONFIG_CONTAINER_KEYS:
+        actual_key = key_lookup.get(logical_key)
+        if actual_key is None:
+            continue
+        container = data.get(actual_key)
+        if not isinstance(container, dict):
+            continue
+        nested_lookup = _json_key_lookup(container)
+        for nested_key in PLUGIN_CONFIG_SECTION_KEYS + (PLUGIN_NAME.lower(),):
+            actual_nested = nested_lookup.get(nested_key)
+            if actual_nested is None:
+                continue
+            section = container.get(actual_nested)
+            if isinstance(section, dict):
+                return section, f"{actual_key}.{actual_nested}"
+    plugin_key = key_lookup.get("plugin")
+    if plugin_key is not None and isinstance(data.get(plugin_key), dict):
+        plugin_blob = data.get(plugin_key)
+        plugin_name = str(plugin_blob.get("name", "")).strip().lower()
+        plugin_settings = plugin_blob.get("settings")
+        if isinstance(plugin_settings, dict) and plugin_name in {"", PLUGIN_NAME.lower(), "lumi_guard"}:
+            return plugin_settings, f"{plugin_key}.settings"
+        if any(CLI_ALIASES.get(str(k), str(k)) in FIELD_SPECS for k in plugin_blob.keys()):
+            return plugin_blob, plugin_key
+    if any(CLI_ALIASES.get(str(k), str(k)) in FIELD_SPECS for k in data.keys()):
+        return data, "top_level"
+    return {}, "no_plugin_fields"
+
+
+def _read_json_file(path_like: os.PathLike[str] | str, source_label: str) -> tuple[dict[str, Any], str | None]:
+    path = Path(path_like).expanduser()
+    with path.open("r", encoding="utf-8") as f:
+        blob = json.load(f)
+    payload, section = _normalize_config_blob(blob)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{source_label} did not contain a JSON object")
+    return payload, section
+
+
+def _extract_host_config_path(argv: list[str]) -> str | None:
+    for idx, arg in enumerate(argv):
+        if not isinstance(arg, str):
+            continue
+        raw = arg.strip().strip('"')
+        if raw.startswith("--config="):
+            return raw.split("=", 1)[1].strip().strip('"')
+        if raw in {"--config", "-c"} and idx + 1 < len(argv):
+            return str(argv[idx + 1]).strip().strip('"')
+    return None
+
+
+def _sidecar_candidates_for_host_config(host_config_path: str | None) -> list[Path]:
+    if not host_config_path:
+        return []
+    host_path = Path(host_config_path).expanduser()
+    if not host_path.name:
+        return []
+    out: list[Path] = []
+    for suffix in HOST_CONFIG_SIDECAR_SUFFIXES:
+        out.append(host_path.with_name(f"{host_path.stem}{suffix}"))
+    out.extend([
+        host_path.with_name("Lumi_GS_pruning.json"),
+        host_path.with_name("lumi_gs_pruning.json"),
+        host_path.with_name("lumi_guard.json"),
+    ])
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in out:
+        key = str(candidate.resolve()) if candidate.exists() else str(candidate)
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def _json_dumps_compact(value: Any) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        return str(value)
+
+
+def get_last_runtime_init_report() -> dict[str, Any]:
+    return dict(_LAST_RUNTIME_INIT_REPORT)
+
+
+def log_runtime_settings_summary(settings: GuardSettings, report: dict[str, Any] | None = None):
+    report = dict(_LAST_RUNTIME_INIT_REPORT if report is None else report)
+    source_bits = []
+    if report.get("persistent_loaded"):
+        source_bits.append("persistent_settings")
+    source_bits.extend(str(item) for item in report.get("sources", []) if item)
+    source_text = ", ".join(source_bits) if source_bits else "defaults_only"
+    override_keys = report.get("override_keys") or []
+    lf.log.info(f"[{PLUGIN_NAME}] Runtime config sources: {source_text}")
+    if override_keys:
+        lf.log.info(f"[{PLUGIN_NAME}] Runtime override keys: {', '.join(str(k) for k in override_keys)}")
+    lf.log.info(f"[{PLUGIN_NAME}] Effective settings: {_json_dumps_compact(settings_to_dict(settings))}")
+
+
+def collect_runtime_overrides(argv: list[str] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    overrides: dict[str, Any] = {}
+    sources: list[str] = []
+    override_keys: list[str] = []
+
+    def merge_blob(blob: dict[str, Any], source: str):
+        nonlocal overrides, sources, override_keys
+        if not isinstance(blob, dict) or not blob:
+            return
+        overrides.update(blob)
+        sources.append(source)
+        for key in blob.keys():
+            normalized = CLI_ALIASES.get(str(key), str(key))
+            if normalized not in override_keys:
+                override_keys.append(normalized)
+
+    host_config_path = _extract_host_config_path(argv)
+    if host_config_path:
+        try:
+            blob, section = _read_json_file(host_config_path, "host config")
+            if blob:
+                section_label = f"#{section}" if section and section != "top_level" else ""
+                merge_blob(blob, f"host_config:{host_config_path}{section_label}")
+        except FileNotFoundError:
+            lf.log.warn(f"[{PLUGIN_NAME}] Host config file not found: {host_config_path}")
+        except Exception as exc:
+            lf.log.warn(f"[{PLUGIN_NAME}] Failed to inspect host config {host_config_path}: {exc}")
+        for candidate in _sidecar_candidates_for_host_config(host_config_path):
+            if not candidate.exists():
+                continue
+            try:
+                blob, section = _read_json_file(candidate, "host config sidecar")
+                section_label = f"#{section}" if section and section != "top_level" else ""
+                merge_blob(blob, f"host_config_sidecar:{candidate}{section_label}")
+                break
+            except Exception as exc:
+                lf.log.warn(f"[{PLUGIN_NAME}] Failed to read sidecar config {candidate}: {exc}")
+
+    prefixes = ("--lumi-gs-pruning-", "--lumi-guard-", "--lumi-")
+    for arg in argv:
+        extracted = _extract_prefixed_arg(arg, prefixes)
+        if extracted is None:
+            continue
+        if extracted.startswith("no-"):
+            key = _normalize_cli_name(extracted[3:])
+            if key in FIELD_SPECS and FIELD_SPECS[key]["type"] == "bool":
+                merge_blob({key: False}, f"cli_flag:{key}=false")
+            continue
+        if "=" not in extracted:
+            key = _normalize_cli_name(extracted)
+            if key in FIELD_SPECS and FIELD_SPECS[key]["type"] == "bool":
+                merge_blob({key: True}, f"cli_flag:{key}=true")
+            continue
+        raw_key, raw_value = extracted.split("=", 1)
+        key = _normalize_cli_name(raw_key)
+        if key in {"json", "config_json"}:
+            try:
+                blob, section = _normalize_config_blob(json.loads(raw_value))
+                section_label = f"#{section}" if section and section != "top_level" else ""
+                merge_blob(blob, f"cli_json{section_label}")
+            except Exception as exc:
+                lf.log.warn(f"[{PLUGIN_NAME}] Failed to parse CLI JSON overrides: {exc}")
+            continue
+        if key in {"file", "config_file"}:
+            try:
+                blob, section = _read_json_file(raw_value, "CLI config file")
+                section_label = f"#{section}" if section and section != "top_level" else ""
+                merge_blob(blob, f"cli_file:{raw_value}{section_label}")
+            except Exception as exc:
+                lf.log.warn(f"[{PLUGIN_NAME}] Failed to read CLI config file {raw_value}: {exc}")
+            continue
+        merge_blob({key: raw_value}, f"cli_value:{key}")
+
+    env_json = os.environ.get("LUMI_GS_PRUNING_JSON") or os.environ.get("LUMI_GUARD_JSON")
+    if env_json:
+        try:
+            blob, section = _normalize_config_blob(json.loads(env_json))
+            section_label = f"#{section}" if section and section != "top_level" else ""
+            merge_blob(blob, f"env_json{section_label}")
+        except Exception as exc:
+            lf.log.warn(f"[{PLUGIN_NAME}] Failed to parse env JSON overrides: {exc}")
+    env_file = os.environ.get("LUMI_GS_PRUNING_FILE") or os.environ.get("LUMI_GUARD_FILE")
+    if env_file:
+        try:
+            blob, section = _read_json_file(env_file, "env config file")
+            section_label = f"#{section}" if section and section != "top_level" else ""
+            merge_blob(blob, f"env_file:{env_file}{section_label}")
+        except Exception as exc:
+            lf.log.warn(f"[{PLUGIN_NAME}] Failed to read env config file {env_file}: {exc}")
+
+    return overrides, {"sources": sources, "override_keys": override_keys, "host_config_path": host_config_path}
+
+
+
 def _load_local_payload() -> str:
     try:
         if LOCAL_PERSIST_PATH.exists():
@@ -327,68 +542,26 @@ def _extract_prefixed_arg(arg: str, prefixes: tuple[str, ...]):
 
 
 def parse_cli_overrides(argv: list[str] | None = None) -> dict[str, Any]:
-    argv = list(sys.argv[1:] if argv is None else argv)
-    overrides: dict[str, Any] = {}
-    prefixes = ("--lumi-gs-pruning-", "--lumi-guard-", "--lumi-")
-    for arg in argv:
-        extracted = _extract_prefixed_arg(arg, prefixes)
-        if extracted is None:
-            continue
-        if extracted.startswith("no-"):
-            key = _normalize_cli_name(extracted[3:])
-            if key in FIELD_SPECS and FIELD_SPECS[key]["type"] == "bool":
-                overrides[key] = False
-            continue
-        if "=" not in extracted:
-            key = _normalize_cli_name(extracted)
-            if key in FIELD_SPECS and FIELD_SPECS[key]["type"] == "bool":
-                overrides[key] = True
-            continue
-        raw_key, raw_value = extracted.split("=", 1)
-        key = _normalize_cli_name(raw_key)
-        if key in {"json", "config_json"}:
-            try:
-                blob = json.loads(raw_value)
-                if isinstance(blob, dict):
-                    overrides.update(blob)
-            except Exception as exc:
-                lf.log.warn(f"[{PLUGIN_NAME}] Failed to parse CLI JSON overrides: {exc}")
-            continue
-        if key in {"file", "config_file"}:
-            try:
-                with open(raw_value, "r", encoding="utf-8") as f:
-                    blob = json.load(f)
-                if isinstance(blob, dict):
-                    overrides.update(blob)
-            except Exception as exc:
-                lf.log.warn(f"[{PLUGIN_NAME}] Failed to read CLI config file {raw_value}: {exc}")
-            continue
-        overrides[key] = raw_value
-    env_json = os.environ.get("LUMI_GS_PRUNING_JSON") or os.environ.get("LUMI_GUARD_JSON")
-    if env_json:
-        try:
-            blob = json.loads(env_json)
-            if isinstance(blob, dict):
-                overrides.update(blob)
-        except Exception as exc:
-            lf.log.warn(f"[{PLUGIN_NAME}] Failed to parse env JSON overrides: {exc}")
-    env_file = os.environ.get("LUMI_GS_PRUNING_FILE") or os.environ.get("LUMI_GUARD_FILE")
-    if env_file:
-        try:
-            with open(env_file, "r", encoding="utf-8") as f:
-                blob = json.load(f)
-            if isinstance(blob, dict):
-                overrides.update(blob)
-        except Exception as exc:
-            lf.log.warn(f"[{PLUGIN_NAME}] Failed to read env config file {env_file}: {exc}")
+    overrides, _meta = collect_runtime_overrides(argv)
     return overrides
 
 
+
+
 def initialize_runtime_settings(settings: GuardSettings | None = None):
+    global _LAST_RUNTIME_INIT_REPORT
     settings = settings or GuardSettings.get_instance()
-    load_persistent_settings(settings)
-    cli = parse_cli_overrides()
+    persistent_loaded = load_persistent_settings(settings)
+    cli, meta = collect_runtime_overrides()
     if cli:
-        apply_dict(settings, cli, log_prefix="CLI")
+        apply_dict(settings, cli, log_prefix="runtime")
         save_persistent_settings(settings)
+    _LAST_RUNTIME_INIT_REPORT = {
+        "persistent_loaded": bool(persistent_loaded),
+        "sources": list(meta.get("sources", [])),
+        "override_keys": list(meta.get("override_keys", [])),
+        "host_config_path": meta.get("host_config_path"),
+        "effective_settings": settings_to_dict(settings),
+    }
+    log_runtime_settings_summary(settings, _LAST_RUNTIME_INIT_REPORT)
     return settings
