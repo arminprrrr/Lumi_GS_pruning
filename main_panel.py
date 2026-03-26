@@ -1,15 +1,7 @@
 import lichtfeld as lf
 
 from .pruner import get_pruner
-from .settings import (
-    ACTION_ITEMS,
-    CENTER_MODE_ITEMS,
-    GuardSettings,
-    SCALE_SCOPE_ITEMS,
-    load_persistent_settings,
-    save_persistent_settings,
-    set_setting_value,
-)
+from .settings import ACTION_ITEMS, CENTER_MODE_ITEMS, GuardSettings, SCALE_SCOPE_ITEMS, load_persistent_settings, save_persistent_settings
 
 
 class ObjectConstraintPanel(lf.ui.Panel):
@@ -35,41 +27,33 @@ class ObjectConstraintPanel(lf.ui.Panel):
         del args
         self._redraw()
 
-    def _sync_runtime_settings(self):
-        guard = get_pruner()
-        if guard is not None:
-            guard.refresh_settings_snapshot()
-
     def _save(self, settings):
         save_persistent_settings(settings)
-        self._sync_runtime_settings()
         self._redraw()
-
-    def _set_and_save(self, settings, attr: str, value):
-        changed = set_setting_value(settings, attr, value)
-        if changed:
-            self._save(settings)
-        return changed
 
     def _draw_bool(self, layout, settings, attr: str, label: str):
         changed, value = layout.checkbox(label, bool(getattr(settings, attr)))
         if changed:
-            self._set_and_save(settings, attr, bool(value))
+            setattr(settings, attr, bool(value))
+            self._save(settings)
 
     def _draw_input_int(self, layout, settings, attr: str, label: str, step: int = 1, step_fast: int = 100):
         changed, value = layout.input_int(label, int(getattr(settings, attr)), step=step, step_fast=step_fast)
         if changed:
-            self._set_and_save(settings, attr, int(value))
+            setattr(settings, attr, int(value))
+            self._save(settings)
 
     def _draw_input_float(self, layout, settings, attr: str, label: str, step: float = 0.0, step_fast: float = 0.0, fmt: str = "%.4f"):
         changed, value = layout.input_float(label, float(getattr(settings, attr)), step=step, step_fast=step_fast, format=fmt)
         if changed:
-            self._set_and_save(settings, attr, float(value))
+            setattr(settings, attr, float(value))
+            self._save(settings)
 
     def _draw_input_text(self, layout, settings, attr: str, label: str):
         changed, value = layout.input_text(label, str(getattr(settings, attr)))
         if changed:
-            self._set_and_save(settings, attr, str(value))
+            setattr(settings, attr, str(value))
+            self._save(settings)
 
     def _draw_combo(self, layout, settings, attr: str, label: str, items):
         ids = [item[0] for item in items]
@@ -81,7 +65,8 @@ class ObjectConstraintPanel(lf.ui.Panel):
             current_idx = 0
         changed, new_idx = layout.combo(label, current_idx, labels)
         if changed:
-            self._set_and_save(settings, attr, ids[int(new_idx)])
+            setattr(settings, attr, ids[int(new_idx)])
+            self._save(settings)
 
     def _draw_center_inputs(self, layout, settings):
         layout.label("Center XYZ")
@@ -93,7 +78,8 @@ class ObjectConstraintPanel(lf.ui.Panel):
                 center[idx] = float(value)
                 changed_any = True
         if changed_any:
-            self._set_and_save(settings, "center", tuple(center))
+            settings.center = tuple(center)
+            self._save(settings)
 
     def _draw_rule_block(self, layout, settings, rule_prefix: str, title: str, threshold_start_attr: str, threshold_end_attr: str, start_label: str, end_label: str, fmt: str):
         layout.separator()
@@ -107,7 +93,6 @@ class ObjectConstraintPanel(lf.ui.Panel):
         self._draw_input_float(layout, settings, f"{rule_prefix}_opacity_end", f"Opacity multiplier end##{rule_prefix}", step=0.0, step_fast=0.0, fmt="%.6f")
         self._draw_input_float(layout, settings, f"{rule_prefix}_scale_multiplier_start", f"Scale multiplier start##{rule_prefix}", step=0.0, step_fast=0.0, fmt="%.6f")
         self._draw_input_float(layout, settings, f"{rule_prefix}_scale_multiplier_end", f"Scale multiplier end##{rule_prefix}", step=0.0, step_fast=0.0, fmt="%.6f")
-
 
     def _draw_runtime(self, layout, guard):
         thresholds = guard.current_thresholds()
@@ -154,11 +139,9 @@ class ObjectConstraintPanel(lf.ui.Panel):
         scale = layout.get_dpi_scale()
         if layout.button("Reload saved settings", (-1, 28 * scale)):
             load_persistent_settings(settings)
-            self._sync_runtime_settings()
             self._redraw()
         if layout.button("Save settings now", (-1, 28 * scale)):
             save_persistent_settings(settings)
-            self._sync_runtime_settings()
             self._redraw()
 
     def draw(self, layout):

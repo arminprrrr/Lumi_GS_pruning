@@ -1,7 +1,7 @@
 import json
 import os
 import sys
-import threading
+from pathlib import Path
 from typing import Any
 
 import lichtfeld as lf
@@ -16,15 +16,9 @@ from lfs_plugins.props import (
 )
 
 PLUGIN_NAME = "Lumi_GS_pruning"
-PERSIST_KEY = "guard_settings_v7_json"
-LEGACY_PERSIST_KEYS = (
-    "guard_settings_v6_json",
-    "guard_settings_v5_json",
-    "guard_settings_v4_json",
-    "guard_settings_v3_json",
-    "guard_settings_v2_json",
-)
-_SETTINGS_IO_LOCK = threading.RLock()
+PERSIST_KEY = "guard_settings_v4_json"
+LEGACY_PERSIST_KEYS = ("guard_settings_v4_json", "guard_settings_v3_json", "guard_settings_v2_json")
+LOCAL_PERSIST_PATH = Path(__file__).with_name("guard_settings.json")
 
 ACTION_ITEMS = [
     ("none", "None", "Do not apply any action to matched Gaussians"),
@@ -85,7 +79,6 @@ class GuardSettings(PropertyGroup):
     aspect_opacity_end = FloatProperty(default=0.10, min=0.000001, max=1.0, step=0.01, precision=6, name="Stretch opacity multiplier end")
     aspect_scale_multiplier_start = FloatProperty(default=0.50, min=0.000001, max=1000000.0, step=0.01, precision=6, name="Stretch scale multiplier start")
     aspect_scale_multiplier_end = FloatProperty(default=0.50, min=0.000001, max=1000000.0, step=0.01, precision=6, name="Stretch scale multiplier end")
-
 
     log_each_hit = BoolProperty(default=True, name="Log updates", description="Write activity to the LichtFeld log")
 
@@ -187,61 +180,27 @@ def _coerce_field(name: str, value: Any):
     raise ValueError(f"Unsupported field type for {name}: {field_type}")
 
 
-def _to_plain_value(name: str, value: Any):
-    field_type = FIELD_SPECS[name]["type"]
-    if field_type == "bool":
-        return bool(value)
-    if field_type == "int":
-        return int(value)
-    if field_type == "float":
-        return float(value)
-    if field_type == "float3":
-        return [float(v) for v in value]
-    if field_type in {"enum", "string"}:
-        return str(value)
-    return value
-
-
 def settings_to_dict(settings: GuardSettings) -> dict[str, Any]:
-    with _SETTINGS_IO_LOCK:
-        return {name: _to_plain_value(name, getattr(settings, name)) for name in FIELD_SPECS}
-
-
-def snapshot_settings(settings: GuardSettings | None = None) -> dict[str, Any]:
-    settings = settings or GuardSettings.get_instance()
-    return settings_to_dict(settings)
+    return {name: getattr(settings, name) for name in FIELD_SPECS}
 
 
 def apply_dict(settings: GuardSettings, data: dict[str, Any], log_prefix: str = "settings"):
     changed = False
-    with _SETTINGS_IO_LOCK:
-        for raw_name, raw_value in data.items():
-            name = CLI_ALIASES.get(raw_name, raw_name)
-            if name not in FIELD_SPECS:
-                if raw_name in {"phases", "use_phases", "enable_max_gaussians_schedule", "max_gaussians_start", "max_gaussians_end"} or raw_name.endswith("_clamp_start") or raw_name.endswith("_clamp_end"):
-                    continue
-                lf.log.warn(f"[{PLUGIN_NAME}] Unknown {log_prefix} field ignored: {raw_name}")
+    for raw_name, raw_value in data.items():
+        name = CLI_ALIASES.get(raw_name, raw_name)
+        if name not in FIELD_SPECS:
+            if raw_name in {"phases", "use_phases"} or raw_name.endswith("_clamp_start") or raw_name.endswith("_clamp_end"):
                 continue
-            try:
-                value = _coerce_field(name, raw_value)
-                if getattr(settings, name) != value:
-                    setattr(settings, name, value)
-                    changed = True
-            except Exception as exc:
-                lf.log.warn(f"[{PLUGIN_NAME}] Failed to apply {log_prefix} field {raw_name}: {exc}")
+            lf.log.warn(f"[{PLUGIN_NAME}] Unknown {log_prefix} field ignored: {raw_name}")
+            continue
+        try:
+            value = _coerce_field(name, raw_value)
+            if getattr(settings, name) != value:
+                setattr(settings, name, value)
+                changed = True
+        except Exception as exc:
+            lf.log.warn(f"[{PLUGIN_NAME}] Failed to apply {log_prefix} field {raw_name}: {exc}")
     return changed
-
-
-def set_setting_value(settings: GuardSettings, name: str, value: Any):
-    if name not in FIELD_SPECS:
-        raise KeyError(name)
-    coerced = _coerce_field(name, value)
-    with _SETTINGS_IO_LOCK:
-        current = getattr(settings, name)
-        if current == coerced:
-            return False
-        setattr(settings, name, coerced)
-    return True
 
 
 def _get_plugin_store():
@@ -293,13 +252,37 @@ def _store_set(store, key: str, value):
         return False
 
 
+
+def _load_local_payload() -> str:
+    try:
+        if LOCAL_PERSIST_PATH.exists():
+            return LOCAL_PERSIST_PATH.read_text(encoding="utf-8").strip()
+    except Exception as exc:
+        lf.log.warn(f"[{PLUGIN_NAME}] Failed to read local settings file {LOCAL_PERSIST_PATH}: {exc}")
+    return ""
+
+
+def _save_local_payload(payload: str) -> bool:
+    try:
+        LOCAL_PERSIST_PATH.write_text(str(payload), encoding="utf-8")
+        return True
+    except Exception as exc:
+        lf.log.warn(f"[{PLUGIN_NAME}] Failed to write local settings file {LOCAL_PERSIST_PATH}: {exc}")
+        return False
+
 def load_persistent_settings(settings: GuardSettings):
     store = _get_plugin_store()
     payload = ""
-    for key in LEGACY_PERSIST_KEYS:
+    loaded_from = None
+    for key in (PERSIST_KEY, *LEGACY_PERSIST_KEYS):
         payload = _store_get(store, key, "") or ""
         if payload:
+            loaded_from = key
             break
+    if not payload:
+        payload = _load_local_payload()
+        if payload:
+            loaded_from = "local_file"
     if not payload:
         return False
     try:
@@ -311,22 +294,25 @@ def load_persistent_settings(settings: GuardSettings):
         lf.log.warn(f"[{PLUGIN_NAME}] Saved settings payload must be a dict")
         return False
     changed = apply_dict(settings, data, log_prefix="saved")
+    if loaded_from != PERSIST_KEY:
+        save_persistent_settings(settings)
     return bool(changed or data)
 
 
 def save_persistent_settings(settings: GuardSettings):
-    store = _get_plugin_store()
-    if store is None:
-        return False
     try:
         payload = json.dumps(settings_to_dict(settings), sort_keys=True)
     except Exception as exc:
         lf.log.warn(f"[{PLUGIN_NAME}] Failed to serialize settings: {exc}")
         return False
-    ok = _store_set(store, PERSIST_KEY, payload)
-    if not ok:
+    store = _get_plugin_store()
+    store_ok = _store_set(store, PERSIST_KEY, payload) if store is not None else False
+    file_ok = _save_local_payload(payload)
+    if store is not None and not store_ok:
+        lf.log.warn(f"[{PLUGIN_NAME}] Failed to save persistent settings to plugin store")
+    if not store_ok and not file_ok:
         lf.log.warn(f"[{PLUGIN_NAME}] Failed to save persistent settings")
-    return ok
+    return bool(store_ok or file_ok)
 
 
 def _normalize_cli_name(name: str) -> str:

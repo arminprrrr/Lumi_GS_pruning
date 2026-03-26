@@ -2,7 +2,7 @@ import lichtfeld as lf
 
 from .main_panel import ObjectConstraintPanel
 from .pruner import install_pruner, uninstall_pruner
-from .settings import GuardSettings, initialize_runtime_settings
+from .settings import GuardSettings, initialize_runtime_settings, save_persistent_settings
 
 _classes = [ObjectConstraintPanel]
 
@@ -16,6 +16,10 @@ def on_load():
 
 
 def on_unload():
+    try:
+        save_persistent_settings(GuardSettings.get_instance())
+    except Exception as exc:
+        lf.log.warn(f"Lumi_GS_pruning: failed to save settings on unload: {exc}")
     uninstall_pruner()
     for cls in reversed(_classes):
         try:
