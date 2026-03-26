@@ -5,7 +5,7 @@ from typing import Any
 import lichtfeld as lf
 from lfs_plugins.ui.state import AppState
 
-from .settings import GuardSettings, save_persistent_settings
+from .settings import GuardSettings, save_persistent_settings, snapshot_settings
 
 _EPS = 1e-8
 _PLUGIN_OWNER = "Lumi_GS_pruning"
@@ -32,12 +32,16 @@ def install_pruner():
 
 def uninstall_pruner():
     global _PRUNER
+    if _PRUNER is not None:
+        _PRUNER.deactivate()
     _PRUNER = None
 
 
 class ObjectConstraintPruner:
     def __init__(self):
         self.settings = GuardSettings.get_instance()
+        self._settings_snapshot = snapshot_settings(self.settings)
+        self._active = True
         self.center_xyz = None
         self.last_removed = 0
         self.total_removed = 0
@@ -56,8 +60,22 @@ class ObjectConstraintPruner:
         AppState.trainer_state.subscribe_as(_PLUGIN_OWNER, self._on_trainer_state_signal)
         AppState.has_trainer.subscribe_as(_PLUGIN_OWNER, self._on_has_trainer_signal)
 
+    def deactivate(self):
+        self._active = False
+
+    def _is_live(self) -> bool:
+        return self._active and self is _PRUNER
+
     def save_settings(self):
         save_persistent_settings(self.settings)
+        self.refresh_settings_snapshot()
+
+    def refresh_settings_snapshot(self):
+        self._settings_snapshot = snapshot_settings(self.settings)
+        return dict(self._settings_snapshot)
+
+    def _settings(self) -> dict[str, Any]:
+        return dict(self._settings_snapshot)
 
     def _request_redraw(self):
         try:
@@ -82,7 +100,8 @@ class ObjectConstraintPruner:
     def _set_status(self, message: str, level: str = "info"):
         self.status_message = message
         self._append_status_log(message, level=level)
-        if bool(self.settings.log_each_hit) or level in ("warn", "error"):
+        log_each_hit = bool(self._settings_snapshot.get("log_each_hit", True))
+        if log_each_hit or level in ("warn", "error"):
             if level == "warn":
                 lf.log.warn(f"[{_PLUGIN_OWNER}] {message}")
             elif level == "error":
@@ -140,6 +159,7 @@ class ObjectConstraintPruner:
         t = max(0.0, min(1.0, float(t)))
         return float(start) + (float(end) - float(start)) * t
 
+
     def _progress_ratio(self, iteration: int) -> float:
         total = self._current_total_iterations()
         return 1.0 if total <= 1 else max(0.0, min(1.0, float(iteration) / float(total - 1)))
@@ -157,29 +177,57 @@ class ObjectConstraintPruner:
             self._set_status(f"Invalid iteration spec ignored: {text}", level="warn")
             return None
 
-    def _build_rule_config(self, rule: str, progress: float):
+    def _build_rule_config(self, rule: str, progress: float, settings_snapshot: dict[str, Any]):
         start_attr, end_attr = _THRESHOLD_ATTRS[rule]
-        threshold = self._lerp(getattr(self.settings, start_attr), getattr(self.settings, end_attr), progress)
+        threshold = self._lerp(settings_snapshot[start_attr], settings_snapshot[end_attr], progress)
         threshold = max(1.0, float(threshold)) if rule == "aspect" else max(0.0, float(threshold))
-        opacity_multiplier = max(1e-6, min(1.0, self._lerp(getattr(self.settings, f"{rule}_opacity_start"), getattr(self.settings, f"{rule}_opacity_end"), progress)))
-        scale_multiplier = max(1e-6, self._lerp(getattr(self.settings, f"{rule}_scale_multiplier_start"), getattr(self.settings, f"{rule}_scale_multiplier_end"), progress))
+        opacity_multiplier = max(
+            1e-6,
+            min(
+                1.0,
+                self._lerp(
+                    settings_snapshot[f"{rule}_opacity_start"],
+                    settings_snapshot[f"{rule}_opacity_end"],
+                    progress,
+                ),
+            ),
+        )
+        scale_multiplier = max(
+            1e-6,
+            self._lerp(
+                settings_snapshot[f"{rule}_scale_multiplier_start"],
+                settings_snapshot[f"{rule}_scale_multiplier_end"],
+                progress,
+            ),
+        )
         return {
-            "enabled": bool(getattr(self.settings, f"enable_{rule}")),
+            "enabled": bool(settings_snapshot[f"enable_{rule}"]),
             "threshold": threshold,
-            "action": str(getattr(self.settings, f"{rule}_action")),
-            "scale_scope": str(getattr(self.settings, f"{rule}_scale_scope")),
+            "action": str(settings_snapshot[f"{rule}_action"]),
+            "scale_scope": str(settings_snapshot[f"{rule}_scale_scope"]),
             "opacity_multiplier": opacity_multiplier,
             "scale_multiplier": scale_multiplier,
         }
 
-    def _current_profile(self, iteration: int | None = None):
+    def _current_profile(self, iteration: int | None = None, settings_snapshot: dict[str, Any] | None = None):
         iteration = self._current_iteration() if iteration is None else int(iteration)
+        settings_snapshot = self._settings() if settings_snapshot is None else dict(settings_snapshot)
         progress = self._progress_ratio(iteration)
-        rules = {rule: self._build_rule_config(rule, progress) for rule in _RULES}
+        rules = {rule: self._build_rule_config(rule, progress, settings_snapshot) for rule in _RULES}
         self.last_thresholds = {rule: rules[rule]["threshold"] for rule in _RULES}
-        self.last_rule_values = {rule: {"opacity_multiplier": rules[rule]["opacity_multiplier"], "scale_multiplier": rules[rule]["scale_multiplier"], "action": rules[rule]["action"]} for rule in _RULES}
+        self.last_rule_values = {
+            rule: {
+                "opacity_multiplier": rules[rule]["opacity_multiplier"],
+                "scale_multiplier": rules[rule]["scale_multiplier"],
+                "action": rules[rule]["action"],
+            }
+            for rule in _RULES
+        }
         self.active_profile_label = "Global"
-        return {"label": "Global", "rules": rules}
+        return {
+            "label": "Global",
+            "rules": rules,
+        }
 
     def current_thresholds(self, iteration: int | None = None) -> dict[str, float]:
         self._current_profile(iteration)
@@ -191,6 +239,7 @@ class ObjectConstraintPruner:
         if hasattr(lf.Tensor, "log"):
             return lf.Tensor.log(tensor)
         import numpy as np
+
         cpu_np = tensor.cpu().numpy(copy=True)
         out = lf.Tensor.from_numpy(np.log(cpu_np), copy=True).to(tensor.dtype)
         return out.cuda() if getattr(tensor, "is_cuda", False) else out
@@ -271,16 +320,40 @@ class ObjectConstraintPruner:
     def _masked_count(self, mask) -> int:
         return 0 if mask is None else int(mask.sum().item())
 
+    def _set_container_value(self, container, name: str, value: int) -> bool:
+        try:
+            if hasattr(container, "set") and callable(getattr(container, "set")):
+                container.set(name, int(value))
+                return True
+        except Exception:
+            pass
+        try:
+            setattr(container, name, int(value))
+            return True
+        except Exception:
+            pass
+        try:
+            container[name] = int(value)
+            return True
+        except Exception:
+            return False
+
     def _on_has_trainer_signal(self, has_trainer: bool):
+        if not self._is_live():
+            return
         if not has_trainer:
             self._set_status("No trainer available.", level="warn")
             self._request_redraw()
 
     def _on_trainer_state_signal(self, state: str):
+        if not self._is_live():
+            return
         self._set_status(f"Trainer state: {state}")
         self._request_redraw()
 
     def _on_iteration_signal(self, iteration: int):
+        if not self._is_live():
+            return
         try:
             self.last_seen_iteration = int(iteration)
             self.current_thresholds(self.last_seen_iteration)
@@ -289,7 +362,11 @@ class ObjectConstraintPruner:
             self._set_status(f"Iteration signal failed: {exc}", level="error")
             self._request_redraw()
 
-    def on_training_start(self):
+    def on_training_start(self, *args, **kwargs):
+        del args, kwargs
+        if not self._is_live():
+            return
+        settings_snapshot = self.refresh_settings_snapshot()
         self.last_removed = 0
         self.total_removed = 0
         self.last_seen_iteration = -1
@@ -298,10 +375,14 @@ class ObjectConstraintPruner:
         self.last_actions = []
         self.pending_manual_prune = False
         self.current_thresholds(0)
-        if not bool(self.settings.enabled):
+
+        self.current_thresholds(0)
+
+        if not bool(settings_snapshot.get("enabled", True)):
             self._set_status("Training started. Plugin is disabled, so it will not modify the model.")
             self._request_redraw()
             return
+
         scene = lf.get_scene()
         model = scene.combined_model() if scene is not None else None
         if model is not None:
@@ -311,8 +392,8 @@ class ObjectConstraintPruner:
                     scene.notify_changed()
                 except Exception:
                     pass
-        if self.settings.center_mode == "manual":
-            self.center_xyz = tuple(float(v) for v in self.settings.center)
+        if settings_snapshot.get("center_mode") == "manual":
+            self.center_xyz = tuple(float(v) for v in settings_snapshot.get("center", (0.0, 0.0, 0.0)))
             self._set_status(f"Training started. Using manual center {self._fmt_center(self.center_xyz)}.")
         else:
             self.center_xyz = None
@@ -322,32 +403,41 @@ class ObjectConstraintPruner:
 
     def on_post_step(self, *args, **kwargs):
         del args, kwargs
+        if not self._is_live():
+            return
         try:
             if not AppState.is_training.value:
                 return
             iteration = self._current_iteration()
             self.last_seen_iteration = iteration
-            if not bool(self.settings.enabled):
+            settings_snapshot = self._settings()
+            self._current_profile(iteration, settings_snapshot)
+
+            if not bool(settings_snapshot.get("enabled", True)):
                 self.pending_manual_prune = False
                 self.current_thresholds(iteration)
             elif self.pending_manual_prune:
                 self.pending_manual_prune = False
-                self.prune_once(manual_trigger=True, forced_iteration=iteration)
+                self.prune_once(manual_trigger=True, forced_iteration=iteration, settings_snapshot=settings_snapshot)
             else:
-                self.prune_once(manual_trigger=False, forced_iteration=iteration)
+                self.prune_once(manual_trigger=False, forced_iteration=iteration, settings_snapshot=settings_snapshot)
             self._request_redraw()
         except Exception as exc:
             self._set_status(f"Post-step callback failed: {exc}", level="error")
             self._request_redraw()
 
-    def on_training_end(self):
+    def on_training_end(self, *args, **kwargs):
+        del args, kwargs
+        if not self._is_live():
+            return
         self.pending_manual_prune = False
         self._set_status("Training ended.")
         self._request_redraw()
 
     def capture_center_from_scene(self, force: bool = False):
-        if self.settings.center_mode == "manual" and not force:
-            self.center_xyz = tuple(float(v) for v in self.settings.center)
+        settings_snapshot = self._settings()
+        if settings_snapshot.get("center_mode") == "manual" and not force:
+            self.center_xyz = tuple(float(v) for v in settings_snapshot.get("center", (0.0, 0.0, 0.0)))
             self._set_status(f"Using manual center {self._fmt_center(self.center_xyz)}.")
             return self.center_xyz
         scene = lf.get_scene()
@@ -367,7 +457,8 @@ class ObjectConstraintPruner:
         return self.center_xyz
 
     def request_manual_prune(self):
-        if not bool(self.settings.enabled):
+        settings_snapshot = self._settings()
+        if not bool(settings_snapshot.get("enabled", True)):
             self.pending_manual_prune = False
             self._set_status("Plugin is disabled. Manual suppression was ignored.")
             self._request_redraw()
@@ -377,7 +468,7 @@ class ObjectConstraintPruner:
             self._set_status("Manual suppression queued for next training step.")
             self._request_redraw()
             return 0
-        out = self.prune_once(manual_trigger=True, forced_iteration=self._current_iteration())
+        out = self.prune_once(manual_trigger=True, forced_iteration=self._current_iteration(), settings_snapshot=settings_snapshot)
         self._request_redraw()
         return out
 
@@ -419,15 +510,15 @@ class ObjectConstraintPruner:
             changed = self._move_toward_center(model, rule_mask) or changed
         return bool(changed)
 
-    def prune_once(self, manual_trigger: bool = False, forced_iteration: int | None = None):
-        s = self.settings
+    def prune_once(self, manual_trigger: bool = False, forced_iteration: int | None = None, settings_snapshot: dict[str, Any] | None = None):
+        settings_snapshot = self._settings() if settings_snapshot is None else dict(settings_snapshot)
         self.last_removed = 0
         self.last_actions = []
         iteration = int(forced_iteration if forced_iteration is not None else self._current_iteration())
-        profile = self._current_profile(iteration)
-        warmup_iter = self.resolve_iter_spec(getattr(s, "warmup_iters", "0")) or 0
-        stop_iter = self.resolve_iter_spec(getattr(s, "stop_iters", ""))
-        if not bool(s.enabled):
+        profile = self._current_profile(iteration, settings_snapshot)
+        warmup_iter = self.resolve_iter_spec(settings_snapshot.get("warmup_iters", "0")) or 0
+        stop_iter = self.resolve_iter_spec(settings_snapshot.get("stop_iters", ""))
+        if not bool(settings_snapshot.get("enabled", True)):
             self.pending_manual_prune = False
             self._set_status("Plugin is disabled.")
             return 0
@@ -443,8 +534,8 @@ class ObjectConstraintPruner:
                 return 0
             if iteration == self.last_pruned_iteration:
                 return 0
-            if iteration % max(1, int(s.apply_every)) != 0:
-                self._set_status(f"Skipping iteration {iteration} (apply_every={int(s.apply_every)}).")
+            if iteration % max(1, int(settings_snapshot.get("apply_every", 1))) != 0:
+                self._set_status(f"Skipping iteration {iteration} (apply_every={int(settings_snapshot.get('apply_every', 1))}).")
                 return 0
         scene = lf.get_scene()
         if scene is None:
@@ -457,8 +548,8 @@ class ObjectConstraintPruner:
         if int(model.num_points) == 0:
             self._set_status("Gaussian model has zero points.", level="warn")
             return 0
-        if s.center_mode == "manual":
-            self.center_xyz = tuple(float(v) for v in s.center)
+        if settings_snapshot.get("center_mode") == "manual":
+            self.center_xyz = tuple(float(v) for v in settings_snapshot.get("center", (0.0, 0.0, 0.0)))
         elif self.center_xyz is None:
             self.capture_center_from_scene(force=True)
         matches, counts = self._build_condition_masks(model, profile["rules"])
@@ -509,7 +600,12 @@ class ObjectConstraintPruner:
         if not actions_taken:
             self._set_status(f"{prefix}: matched radius={counts['radius']}, max_axis={counts['max_axis']}, aspect={counts['aspect']} in {profile['label']}, but no actions were applied.")
             return affected
-        self._set_status(f"{prefix}: profile={profile['label']} affected={affected} (radius={counts['radius']}, max_axis={counts['max_axis']}, aspect={counts['aspect']}; thr_radius={self.last_thresholds['radius']:.4f}, thr_max_axis={self.last_thresholds['max_axis']:.6f}, thr_aspect={self.last_thresholds['aspect']:.4f}); actions={', '.join(actions_taken)}")
+        self._set_status(
+            f"{prefix}: profile={profile['label']} affected={affected} "
+            f"(radius={counts['radius']}, max_axis={counts['max_axis']}, aspect={counts['aspect']}; "
+            f"thr_radius={self.last_thresholds['radius']:.4f}, thr_max_axis={self.last_thresholds['max_axis']:.6f}, thr_aspect={self.last_thresholds['aspect']:.4f}); "
+            f"actions={', '.join(actions_taken)}"
+        )
         return affected
 
     def _build_condition_masks(self, model, rule_configs: dict[str, dict[str, Any]]):
