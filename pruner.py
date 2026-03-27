@@ -3,7 +3,11 @@ from collections import deque
 from typing import Any
 
 import lichtfeld as lf
-from lfs_plugins.ui.state import AppState
+
+try:
+    from lfs_plugins.ui.state import AppState
+except Exception:
+    AppState = None
 
 from .settings import GuardSettings, save_persistent_settings
 
@@ -64,15 +68,33 @@ class ObjectConstraintPruner:
         self.pending_manual_prune = False
         self.last_seen_iteration = -1
         self.last_pruned_iteration = -1
+        self.post_step_calls = 0
+        self.stale_iteration_hits = 0
+        self.iteration_source = "startup"
+        self.iteration_hint = None
         self.last_counts = {"radius": 0, "max_axis": 0, "aspect": 0}
         self.last_actions: list[str] = []
         self.last_thresholds = {"radius": 0.0, "max_axis": 0.0, "aspect": 0.0}
         self.last_rule_values = {rule: {"opacity_multiplier": 1.0, "scale_multiplier": 1.0, "action": "none"} for rule in _RULES}
         self.active_profile_label = "Global"
         self._append_status_log("Idle.", level="info")
-        AppState.iteration.subscribe_as(_PLUGIN_OWNER, self._on_iteration_signal)
-        AppState.trainer_state.subscribe_as(_PLUGIN_OWNER, self._on_trainer_state_signal)
-        AppState.has_trainer.subscribe_as(_PLUGIN_OWNER, self._on_has_trainer_signal)
+        self._subscribe_app_state()
+
+    def _subscribe_app_state(self):
+        if AppState is None:
+            return
+        try:
+            AppState.iteration.subscribe_as(_PLUGIN_OWNER, self._on_iteration_signal)
+        except Exception:
+            pass
+        try:
+            AppState.trainer_state.subscribe_as(_PLUGIN_OWNER, self._on_trainer_state_signal)
+        except Exception:
+            pass
+        try:
+            AppState.has_trainer.subscribe_as(_PLUGIN_OWNER, self._on_has_trainer_signal)
+        except Exception:
+            pass
 
     def save_settings(self):
         save_persistent_settings(self.settings)
@@ -139,20 +161,150 @@ class ObjectConstraintPruner:
         except Exception:
             return False
 
+    def _app_state_value(self, name: str, default=None):
+        if AppState is None:
+            return default
+        try:
+            signal = getattr(AppState, name)
+        except Exception:
+            return default
+        try:
+            return signal.value
+        except Exception:
+            return default
+
+    def _trainer_context(self, refresh: bool = False):
+        try:
+            ctx = lf.context()
+        except Exception:
+            return None
+        if refresh and hasattr(ctx, "refresh"):
+            try:
+                ctx.refresh()
+            except Exception:
+                pass
+        return ctx
+
+    def _trainer_state_text(self) -> str:
+        try:
+            state = lf.trainer_state()
+            if state is not None:
+                text = str(state).strip()
+                if text:
+                    return text
+        except Exception:
+            pass
+        state = self._app_state_value("trainer_state", "")
+        return str(state).strip()
+
+    def _is_training_active(self) -> bool:
+        votes: list[bool] = []
+        ctx = self._trainer_context(refresh=True)
+        if ctx is not None:
+            try:
+                is_training = getattr(ctx, "is_training", None)
+                if is_training is not None:
+                    votes.append(bool(is_training))
+            except Exception:
+                pass
+        state = self._trainer_state_text().lower()
+        if state:
+            votes.append(state in {"running", "training", "refining"})
+        app_state_value = self._app_state_value("is_training", None)
+        if app_state_value is not None:
+            votes.append(bool(app_state_value))
+        return any(votes) if votes else False
+
     def _current_total_iterations(self) -> int:
+        ctx = self._trainer_context(refresh=True)
+        if ctx is not None:
+            try:
+                total = int(getattr(ctx, "max_iterations", 0))
+                if total > 0:
+                    return total
+            except Exception:
+                pass
         try:
             total = int(lf.trainer_total_iterations())
             if total > 0:
                 return total
         except Exception:
             pass
-        return max(1, int(self.last_seen_iteration) + 1)
+        last_seen = max(int(self.last_seen_iteration), int(self._app_state_value("iteration", -1)))
+        return max(1, last_seen + 1)
+
+    def _iteration_candidates(self, refresh: bool = True) -> list[tuple[str, int]]:
+        candidates: list[tuple[str, int]] = []
+        ctx = self._trainer_context(refresh=refresh)
+        if ctx is not None:
+            try:
+                value = int(getattr(ctx, "iteration"))
+                if value >= 0:
+                    candidates.append(("context", value))
+            except Exception:
+                pass
+        try:
+            value = int(lf.trainer_current_iteration())
+            if value >= 0:
+                candidates.append(("trainer_current_iteration", value))
+        except Exception:
+            pass
+        app_value = self._app_state_value("iteration", None)
+        if app_value is not None:
+            try:
+                value = int(app_value)
+                if value >= 0:
+                    candidates.append(("app_state", value))
+            except Exception:
+                pass
+        return candidates
+
+    def _resolve_callback_iteration(self) -> int:
+        candidates = self._iteration_candidates(refresh=True)
+        if self.iteration_hint is not None:
+            try:
+                hint_value = int(self.iteration_hint)
+                if hint_value >= 0:
+                    candidates.append(("iteration_start_hint", hint_value))
+            except Exception:
+                pass
+        advanced = [(name, value) for name, value in candidates if value > self.last_seen_iteration]
+        if advanced:
+            name, value = max(advanced, key=lambda item: item[1])
+            self.iteration_source = name
+            self.stale_iteration_hits = 0
+            self.iteration_hint = None
+            return int(value)
+        if candidates:
+            name, value = max(candidates, key=lambda item: item[1])
+            fallback = max(int(self.last_seen_iteration) + 1, int(value))
+            self.stale_iteration_hits += 1
+            self.iteration_source = f"{name}->monotonic"
+            if self.stale_iteration_hits in {3, 10} or (self.stale_iteration_hits % 1000 == 0):
+                self._set_status(
+                    f"Iteration source '{name}' stayed at {value}; continuing with monotonic fallback {fallback}.",
+                    level="warn",
+                )
+            self.iteration_hint = None
+            return int(fallback)
+        fallback = max(0, int(self.last_seen_iteration) + 1)
+        self.stale_iteration_hits += 1
+        self.iteration_source = "local_monotonic"
+        if self.stale_iteration_hits in {3, 10} or (self.stale_iteration_hits % 1000 == 0):
+            self._set_status(
+                f"Training callback has no iteration source; continuing with local fallback {fallback}.",
+                level="warn",
+            )
+        self.iteration_hint = None
+        return int(fallback)
 
     def _current_iteration(self) -> int:
-        try:
-            return int(lf.trainer_current_iteration())
-        except Exception:
-            return int(AppState.iteration.value)
+        candidates = self._iteration_candidates(refresh=True)
+        if candidates:
+            name, value = max(candidates, key=lambda item: item[1])
+            self.iteration_source = name
+            return int(value)
+        return int(self.last_seen_iteration if self.last_seen_iteration >= 0 else 0)
 
     def _lerp(self, start: float, end: float, t: float) -> float:
         t = max(0.0, min(1.0, float(t)))
@@ -300,7 +452,10 @@ class ObjectConstraintPruner:
 
     def _on_iteration_signal(self, iteration: int):
         try:
-            self.last_seen_iteration = int(iteration)
+            value = int(iteration)
+            self.iteration_hint = value
+            self.iteration_source = "app_state->post_step"
+            self.last_seen_iteration = max(self.last_seen_iteration, value)
             self.current_thresholds(self.last_seen_iteration)
             self._request_redraw()
         except Exception as exc:
@@ -313,6 +468,10 @@ class ObjectConstraintPruner:
         self.total_removed = 0
         self.last_seen_iteration = -1
         self.last_pruned_iteration = -1
+        self.post_step_calls = 0
+        self.stale_iteration_hits = 0
+        self.iteration_source = "training_start"
+        self.iteration_hint = None
         self.last_counts = {"radius": 0, "max_axis": 0, "aspect": 0}
         self.last_actions = []
         self.pending_manual_prune = False
@@ -339,21 +498,32 @@ class ObjectConstraintPruner:
                 self._set_status("Training started. Waiting for Gaussians before center capture.", level="warn")
         self._request_redraw()
 
+    def on_iteration_start(self, *args, **kwargs):
+        del args, kwargs
+        try:
+            candidates = self._iteration_candidates(refresh=True)
+            if candidates:
+                name, value = max(candidates, key=lambda item: item[1])
+                self.iteration_hint = int(value)
+                self.iteration_source = f"{name}->post_step"
+                self.current_thresholds(self.iteration_hint)
+        except Exception as exc:
+            self._set_status(f"Iteration-start callback failed: {exc}", level="error")
+
     def on_post_step(self, *args, **kwargs):
         del args, kwargs
         try:
-            if not AppState.is_training.value:
-                return
-            iteration = self._current_iteration()
-            self.last_seen_iteration = iteration
+            self.post_step_calls += 1
+            iteration = self._resolve_callback_iteration()
+            self.last_seen_iteration = max(self.last_seen_iteration, int(iteration))
+            self.current_thresholds(self.last_seen_iteration)
             if not bool(self.settings.enabled):
                 self.pending_manual_prune = False
-                self.current_thresholds(iteration)
             elif self.pending_manual_prune:
                 self.pending_manual_prune = False
-                self.prune_once(manual_trigger=True, forced_iteration=iteration)
+                self.prune_once(manual_trigger=True, forced_iteration=self.last_seen_iteration)
             else:
-                self.prune_once(manual_trigger=False, forced_iteration=iteration)
+                self.prune_once(manual_trigger=False, forced_iteration=self.last_seen_iteration)
             self._request_redraw()
         except Exception as exc:
             self._set_status(f"Post-step callback failed: {exc}", level="error")
@@ -392,7 +562,7 @@ class ObjectConstraintPruner:
             self._set_status("Plugin is disabled. Manual suppression was ignored.")
             self._request_redraw()
             return 0
-        if AppState.is_training.value:
+        if self._is_training_active():
             self.pending_manual_prune = True
             self._set_status("Manual suppression queued for next training step.")
             self._request_redraw()
@@ -452,8 +622,8 @@ class ObjectConstraintPruner:
             self._set_status("Plugin is disabled.")
             return 0
         if not manual_trigger:
-            if not AppState.is_training.value:
-                self._set_status(f"Trainer state: {AppState.trainer_state.value}")
+            if not self._is_training_active():
+                self._set_status(f"Trainer state: {self._trainer_state_text() or 'idle'}")
                 return 0
             if iteration < warmup_iter:
                 self._set_status(f"Warmup active: iteration {iteration} < {warmup_iter}.")
@@ -513,10 +683,12 @@ class ObjectConstraintPruner:
                 scene.notify_changed()
             except Exception:
                 pass
-            try:
-                lf.context().refresh()
-            except Exception:
-                pass
+            ctx = self._trainer_context(refresh=False)
+            if ctx is not None and hasattr(ctx, "refresh"):
+                try:
+                    ctx.refresh()
+                except Exception:
+                    pass
         except Exception as exc:
             self._set_status(f"Suppression failed: {exc}", level="error")
             return 0
@@ -529,7 +701,7 @@ class ObjectConstraintPruner:
         if not actions_taken:
             self._set_status(f"{prefix}: matched radius={counts['radius']}, max_axis={counts['max_axis']}, aspect={counts['aspect']} in {profile['label']}, but no actions were applied.")
             return affected
-        self._set_status(f"{prefix}: profile={profile['label']} affected={affected} (radius={counts['radius']}, max_axis={counts['max_axis']}, aspect={counts['aspect']}; thr_radius={self.last_thresholds['radius']:.4f}, thr_max_axis={self.last_thresholds['max_axis']:.6f}, thr_aspect={self.last_thresholds['aspect']:.4f}); actions={', '.join(actions_taken)}")
+        self._set_status(f"{prefix}: profile={profile['label']} affected={affected} (radius={counts['radius']}, max_axis={counts['max_axis']}, aspect={counts['aspect']}; thr_radius={self.last_thresholds['radius']:.4f}, thr_max_axis={self.last_thresholds['max_axis']:.6f}, thr_aspect={self.last_thresholds['aspect']:.4f}; source={self.iteration_source}); actions={', '.join(actions_taken)}")
         return affected
 
     def _build_condition_masks(self, model, rule_configs: dict[str, dict[str, Any]]):
