@@ -138,6 +138,7 @@ CLI_ALIASES = {
 }
 
 LEGACY_ACTION_MAP = {"clamp": "shrink", "fade_clamp": "fade_shrink"}
+LEGACY_SCALE_SCOPE_MAP = {"all_axis": "all_axes", "allaxis": "all_axes", "largest": "largest_axis"}
 
 
 def _clamp(value: float, lo: float | None = None, hi: float | None = None):
@@ -169,7 +170,11 @@ def _coerce_field(name: str, value: Any):
     if field_type == "float":
         return float(_clamp(float(value), spec.get("min"), spec.get("max")))
     if field_type == "enum":
-        out = LEGACY_ACTION_MAP.get(str(value).strip(), str(value).strip()) if name.endswith("_action") else str(value).strip()
+        out = str(value).strip()
+        if name.endswith("_action"):
+            out = LEGACY_ACTION_MAP.get(out, out)
+        elif name.endswith("_scale_scope"):
+            out = LEGACY_SCALE_SCOPE_MAP.get(out, out)
         if out not in spec["items"]:
             raise ValueError(f"Invalid value for {name}: {value}")
         return out
