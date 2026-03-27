@@ -31,6 +31,9 @@ class ObjectConstraintPanel(lf.ui.Panel):
         save_persistent_settings(settings)
         self._redraw()
 
+    def _safe_text(self, value):
+        return str(value).replace("<", "(").replace(">", ")")
+
     def _draw_bool(self, layout, settings, attr: str, label: str):
         changed, value = layout.checkbox(label, bool(getattr(settings, attr)))
         if changed:
@@ -98,23 +101,23 @@ class ObjectConstraintPanel(lf.ui.Panel):
         thresholds = guard.current_thresholds()
         layout.separator()
         layout.label("Runtime and log")
-        layout.label(f"Active profile: {guard.active_profile_label}")
+        layout.label(f"Active profile: {self._safe_text(guard.active_profile_label)}")
         layout.label(f"Last affected: {guard.last_removed:,}")
         layout.label(f"Total affected: {guard.total_removed:,}")
         layout.label(f"Last seen iteration: {guard.last_seen_iteration}")
         layout.label(f"Last applied iteration: {guard.last_pruned_iteration}")
-        layout.label(f"Captured center: {guard._fmt_center(guard.center_xyz)}")
+        layout.label(f"Captured center: {self._safe_text(guard._fmt_center(guard.center_xyz))}")
         layout.text_colored(f"Current thresholds -> radius={thresholds['radius']:.6f}, max_axis={thresholds['max_axis']:.6f}, aspect={thresholds['aspect']:.6f}", (0.8, 0.9, 0.8, 1.0))
         layout.text_colored(f"Current params -> radius[action={guard.last_rule_values['radius']['action']}, opacity_mult={guard.last_rule_values['radius']['opacity_multiplier']:.4f}, scale_mult={guard.last_rule_values['radius']['scale_multiplier']:.4f}]", (0.8, 0.8, 0.95, 1.0))
         layout.text_colored(f"Current params -> max_axis[action={guard.last_rule_values['max_axis']['action']}, opacity_mult={guard.last_rule_values['max_axis']['opacity_multiplier']:.4f}, scale_mult={guard.last_rule_values['max_axis']['scale_multiplier']:.4f}]", (0.8, 0.8, 0.95, 1.0))
         layout.text_colored(f"Current params -> aspect[action={guard.last_rule_values['aspect']['action']}, opacity_mult={guard.last_rule_values['aspect']['opacity_multiplier']:.4f}, scale_mult={guard.last_rule_values['aspect']['scale_multiplier']:.4f}]", (0.8, 0.8, 0.95, 1.0))
         layout.text_colored(f"Last counts -> radius={guard.last_counts['radius']}, max_axis={guard.last_counts['max_axis']}, aspect={guard.last_counts['aspect']}", (0.8, 0.8, 0.8, 1.0))
-        actions_text = ", ".join(guard.last_actions) if guard.last_actions else "<none>"
-        layout.text_colored(f"Last actions: {actions_text}", (0.8, 0.9, 0.8, 1.0))
-        layout.text_colored(f"Status: {guard.status_message}", (0.7, 0.9, 1.0, 1.0))
+        actions_text = ", ".join(guard.last_actions) if guard.last_actions else "(none)"
+        layout.text_colored(f"Last actions: {self._safe_text(actions_text)}", (0.8, 0.9, 0.8, 1.0))
+        layout.text_colored(f"Status: {self._safe_text(guard.status_message)}", (0.7, 0.9, 1.0, 1.0))
         layout.label("Recent runtime log")
         for line in guard.get_recent_status_lines(limit=10):
-            layout.text_colored(line, (0.85, 0.85, 0.85, 1.0))
+            layout.text_colored(self._safe_text(line), (0.85, 0.85, 0.85, 1.0))
         if layout.button("Clear runtime log", (-1, 24)):
             guard.clear_status_log()
             self._redraw()
