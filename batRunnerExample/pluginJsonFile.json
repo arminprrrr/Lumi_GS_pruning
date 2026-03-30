@@ -1,13 +1,17 @@
 {
   "lumi_gs_pruning": {
     "enabled": true,
-    "log_each_hit": true,
-    "warmup_iters": "500",
+    "log_each_hit": false,
+    "warmup_iters": "0%",
     "stop_iters": "",
-    "apply_every": 25,
+    "apply_every": 1,
+    "enforce_greyscale": false,
     "center_mode": "auto_once",
-    "center": [0.0, 0.0, 0.0],
-
+    "center": [
+      0.0,
+      0.0,
+      0.0
+    ],
     "enable_radius": false,
     "radius_start": 1.0,
     "radius_end": 1.0,
@@ -17,17 +21,15 @@
     "radius_opacity_end": 0.1,
     "radius_scale_multiplier_start": 0.5,
     "radius_scale_multiplier_end": 0.5,
-
     "enable_max_axis": true,
-    "max_axis_start": 0.17,
-    "max_axis_end": 0.17,
-    "max_axis_action": "shrink",
+    "max_axis_start": 0.01,
+    "max_axis_end": 0.01,
+    "max_axis_action": "fade_shrink",
     "max_axis_scale_scope": "largest_axis",
-    "max_axis_opacity_start": 0.1,
-    "max_axis_opacity_end": 0.1,
+    "max_axis_opacity_start": 0.993,
+    "max_axis_opacity_end": 1.0,
     "max_axis_scale_multiplier_start": 0.5,
-    "max_axis_scale_multiplier_end": 0.5,
-
+    "max_axis_scale_multiplier_end": 0.593,
     "enable_aspect": false,
     "max_aspect_start": 10.0,
     "max_aspect_end": 10.0,
