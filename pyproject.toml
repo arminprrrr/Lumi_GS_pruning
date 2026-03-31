@@ -1,7 +1,7 @@
 [project]
 name = "Lumi_GS_pruning"
-version = "0.0.3"
-description = "Training-time gaussian hard pruning by size and radius"
+version = "0.0.4"
+description = "Training-time gaussian pruning and greyscale enforcement"
 authors = [{name = "APR"}]
 dependencies = []
 
