@@ -20,29 +20,6 @@ _THRESHOLD_ATTRS = {
     "max_axis": ("max_axis_start", "max_axis_end"),
     "aspect": ("max_aspect_start", "max_aspect_end"),
 }
-_GREYSCALE_WEIGHTS = (0.2126, 0.7152, 0.0722)
-_GREYSCALE_COLOR_ATTRS = (
-    "features_dc_raw",
-    "features_rest_raw",
-    "sh0_raw",
-    "shs_dc_raw",
-    "shs_rest_raw",
-    "shs_raw",
-    "colors_raw",
-    "rgb_raw",
-    "color_raw",
-    "albedo_raw",
-    "features_dc",
-    "features_rest",
-    "sh0",
-    "shs_dc",
-    "shs_rest",
-    "shs",
-    "colors",
-    "rgb",
-    "color",
-    "albedo",
-)
 
 
 def get_pruner():
@@ -89,7 +66,6 @@ class ObjectConstraintPruner:
         self.status_message = "Idle."
         self.status_log = deque(maxlen=80)
         self.pending_manual_prune = False
-        self.pending_manual_greyscale = False
         self.last_seen_iteration = -1
         self.last_pruned_iteration = -1
         self.post_step_calls = 0
@@ -101,10 +77,6 @@ class ObjectConstraintPruner:
         self.last_thresholds = {"radius": 0.0, "max_axis": 0.0, "aspect": 0.0}
         self.last_rule_values = {rule: {"opacity_multiplier": 1.0, "scale_multiplier": 1.0, "action": "none"} for rule in _RULES}
         self.active_profile_label = "Global"
-        self.last_greyscale_iteration = -1
-        self.last_greyscale_affected = 0
-        self.total_greyscale_affected = 0
-        self.last_greyscale_fields: list[str] = []
         self._append_status_log("Idle.", level="info")
         self._subscribe_app_state()
 
@@ -158,9 +130,6 @@ class ObjectConstraintPruner:
             else:
                 lf.log.info(f"[{_PLUGIN_OWNER}] {message}")
 
-    def _set_status_quiet(self, message: str):
-        self.status_message = message
-
     def _fmt_center(self, center_xyz):
         if center_xyz is None:
             return "<unset>"
@@ -182,124 +151,6 @@ class ObjectConstraintPruner:
         else:
             tensor_view[...] = updated
         return True
-
-    def _shape_dim(self, tensor, dim: int, default: int = 0) -> int:
-        try:
-            return int(tensor.shape[dim])
-        except Exception:
-            return int(default)
-
-    def _build_greyscale_rgb(self, colors):
-        n = self._shape_dim(colors, 0, 0)
-        if n <= 0:
-            return None
-        gray = (colors[:, 0] * 0.2126) + (colors[:, 1] * 0.7152) + (colors[:, 2] * 0.0722)
-        gray_col = gray.unsqueeze(1)
-        out = lf.Tensor.zeros([n, 3], device=colors.device, dtype=colors.dtype)
-        out[:, 0] = gray_col
-        out[:, 1] = gray_col
-        out[:, 2] = gray_col
-        return out
-
-    def _greyscale_higher_sh(self, coeffs) -> bool:
-        if coeffs is None or int(getattr(coeffs, "ndim", 0)) != 3:
-            return False
-        if self._shape_dim(coeffs, 2, 0) != 3:
-            return False
-        if self._shape_dim(coeffs, 1, 0) <= 0:
-            return False
-        gray = (coeffs[:, :, 0] * 0.2126) + (coeffs[:, :, 1] * 0.7152) + (coeffs[:, :, 2] * 0.0722)
-        gray_ch = gray.unsqueeze(2)
-        coeffs[:, :, 0] = gray_ch
-        coeffs[:, :, 1] = gray_ch
-        coeffs[:, :, 2] = gray_ch
-        return True
-
-    def _iter_greyscale_targets(self, scene):
-        found_any = False
-        try:
-            nodes = scene.get_nodes()
-        except Exception:
-            nodes = []
-        for node in nodes:
-            try:
-                splat_data = node.splat_data()
-            except Exception:
-                splat_data = None
-            if splat_data is None:
-                continue
-            found_any = True
-            yield f"node:{getattr(node, 'name', '<unnamed>')}", splat_data
-        if found_any:
-            return
-        try:
-            training_model = scene.training_model()
-        except Exception:
-            training_model = None
-        if training_model is not None:
-            yield "training_model", training_model
-            return
-        try:
-            combined_model = scene.combined_model()
-        except Exception:
-            combined_model = None
-        if combined_model is not None:
-            yield "combined_model", combined_model
-
-    def apply_greyscale_once(self, manual_trigger: bool = False, forced_iteration: int | None = None):
-        iteration = int(forced_iteration if forced_iteration is not None else self._current_iteration())
-        scene = lf.get_scene()
-        if scene is None:
-            self._set_status("No scene loaded. Open a scene first.", level="warn")
-            return 0
-        changed_targets: list[str] = []
-        failures: list[str] = []
-        affected = 0
-        for label, splat_data in self._iter_greyscale_targets(scene):
-            try:
-                point_count = int(getattr(splat_data, "num_points", 0))
-                if point_count <= 0:
-                    continue
-                gray_rgb = self._build_greyscale_rgb(splat_data.get_colors_rgb())
-                if gray_rgb is None:
-                    continue
-                splat_data.set_colors_rgb(gray_rgb)
-                self._greyscale_higher_sh(getattr(splat_data, "shN_raw", None))
-                changed_targets.append(label)
-                affected += point_count
-            except Exception as exc:
-                failures.append(f"{label}: {exc}")
-        self.last_greyscale_iteration = int(iteration)
-        self.last_greyscale_affected = int(affected)
-        self.total_greyscale_affected += int(affected)
-        self.last_greyscale_fields = list(changed_targets)
-        if not changed_targets:
-            details = f" Failures: {'; '.join(failures[:3])}" if failures else ""
-            self._set_status(f"No writable greyscale targets were updated.{details}", level="warn")
-            return 0
-        try:
-            scene.notify_changed()
-        except Exception:
-            pass
-        ctx = self._trainer_context(refresh=False)
-        if ctx is not None and hasattr(ctx, "refresh"):
-            try:
-                ctx.refresh()
-            except Exception:
-                pass
-        if manual_trigger:
-            message = f"Manual greyscale applied to {affected:,} gaussians across {len(changed_targets)} target(s): {', '.join(changed_targets)}"
-            if failures:
-                message += f" Failures: {'; '.join(failures[:3])}"
-            self._set_status(message, level="warn" if failures else "info")
-        else:
-            message = f"Greyscale enforced on {affected:,} gaussians across {len(changed_targets)} target(s)."
-            if failures:
-                message += f" Failures: {'; '.join(failures[:3])}"
-                self._set_status(message, level="warn")
-            else:
-                self._set_status_quiet(message)
-        return affected
 
     def _clear_deleted_mask(self, model):
         if not hasattr(model, "clear_deleted"):
@@ -624,36 +475,27 @@ class ObjectConstraintPruner:
         self.last_counts = {"radius": 0, "max_axis": 0, "aspect": 0}
         self.last_actions = []
         self.pending_manual_prune = False
-        self.pending_manual_greyscale = False
-        self.last_greyscale_iteration = -1
-        self.last_greyscale_affected = 0
-        self.last_greyscale_fields = []
         self.current_thresholds(0)
-        pruning_enabled = bool(self.settings.enabled)
-        greyscale_enabled = bool(getattr(self.settings, "enforce_greyscale", False))
-        if not pruning_enabled and not greyscale_enabled:
+        if not bool(self.settings.enabled):
             self._set_status("Training started. Plugin is disabled, so it will not modify the model.")
             self._request_redraw()
             return
         scene = lf.get_scene()
         model = scene.combined_model() if scene is not None else None
-        if model is not None and pruning_enabled:
+        if model is not None:
             self._clear_deleted_mask(model)
             if scene is not None:
                 try:
                     scene.notify_changed()
                 except Exception:
                     pass
-        if pruning_enabled:
-            if self.settings.center_mode == "manual":
-                self.center_xyz = tuple(float(v) for v in self.settings.center)
-                self._set_status(f"Training started. Using manual center {self._fmt_center(self.center_xyz)}.")
-            else:
-                self.center_xyz = None
-                if self.capture_center_from_scene(force=True) is None:
-                    self._set_status("Training started. Waiting for Gaussians before center capture.", level="warn")
-        if greyscale_enabled:
-            self.apply_greyscale_once(manual_trigger=False, forced_iteration=0)
+        if self.settings.center_mode == "manual":
+            self.center_xyz = tuple(float(v) for v in self.settings.center)
+            self._set_status(f"Training started. Using manual center {self._fmt_center(self.center_xyz)}.")
+        else:
+            self.center_xyz = None
+            if self.capture_center_from_scene(force=True) is None:
+                self._set_status("Training started. Waiting for Gaussians before center capture.", level="warn")
         self._request_redraw()
 
     def on_iteration_start(self, *args, **kwargs):
@@ -682,11 +524,6 @@ class ObjectConstraintPruner:
                 self.prune_once(manual_trigger=True, forced_iteration=self.last_seen_iteration)
             else:
                 self.prune_once(manual_trigger=False, forced_iteration=self.last_seen_iteration)
-            greyscale_manual = bool(self.pending_manual_greyscale)
-            greyscale_enabled = bool(getattr(self.settings, "enforce_greyscale", False))
-            self.pending_manual_greyscale = False
-            if greyscale_manual or greyscale_enabled:
-                self.apply_greyscale_once(manual_trigger=greyscale_manual, forced_iteration=self.last_seen_iteration)
             self._request_redraw()
         except Exception as exc:
             self._set_status(f"Post-step callback failed: {exc}", level="error")
@@ -695,7 +532,6 @@ class ObjectConstraintPruner:
     def on_training_end(self, *args, **kwargs):
         del args, kwargs
         self.pending_manual_prune = False
-        self.pending_manual_greyscale = False
         self._set_status("Training ended.")
         self._request_redraw()
 
@@ -732,16 +568,6 @@ class ObjectConstraintPruner:
             self._request_redraw()
             return 0
         out = self.prune_once(manual_trigger=True, forced_iteration=self._current_iteration())
-        self._request_redraw()
-        return out
-
-    def request_manual_greyscale(self):
-        if self._is_training_active():
-            self.pending_manual_greyscale = True
-            self._set_status("Manual greyscale queued for next training step.")
-            self._request_redraw()
-            return 0
-        out = self.apply_greyscale_once(manual_trigger=True, forced_iteration=self._current_iteration())
         self._request_redraw()
         return out
 

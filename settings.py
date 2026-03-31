@@ -16,7 +16,7 @@ from lfs_plugins.props import (
 )
 
 PLUGIN_NAME = "Lumi_GS_pruning"
-PERSIST_KEY = "guard_settings_v5_json"
+PERSIST_KEY = "guard_settings_v4_json"
 LEGACY_PERSIST_KEYS = ("guard_settings_v4_json", "guard_settings_v3_json", "guard_settings_v2_json")
 LOCAL_PERSIST_PATH = Path(__file__).with_name("guard_settings.json")
 
@@ -52,7 +52,6 @@ class GuardSettings(PropertyGroup):
     warmup_iters = StringProperty(default="0", maxlen=64, name="Warmup iterations", description="Accepts 5000 or 10%")
     stop_iters = StringProperty(default="", maxlen=64, name="Stop iterations", description="Accepts 25000 or 80%")
     apply_every = IntProperty(default=1, min=1, max=100000, step=1, name="Apply every N steps", description="1 = run every iteration")
-    enforce_greyscale = BoolProperty(default=False, name="Enforce greyscale", description="Continuously convert Gaussian colors to greyscale during training and when requested manually")
     center_mode = EnumProperty(items=CENTER_MODE_ITEMS, default="auto_once", name="Center mode", description="How the center is chosen")
     center = FloatVectorProperty(default=(0.0, 0.0, 0.0), size=3, min=-100000.0, max=100000.0, subtype="XYZ", name="Center XYZ", description="Manual center in world space")
 
@@ -94,7 +93,6 @@ FIELD_SPECS = {
     "warmup_iters": {"type": "string"},
     "stop_iters": {"type": "string"},
     "apply_every": {"type": "int", "min": 1, "max": 100000},
-    "enforce_greyscale": {"type": "bool"},
     "center_mode": {"type": "enum", "items": {k for k, _, _ in CENTER_MODE_ITEMS}},
     "center": {"type": "float3", "min": -100000.0, "max": 100000.0},
     "log_each_hit": {"type": "bool"},
@@ -137,9 +135,6 @@ CLI_ALIASES = {
     "radius_scope": "radius_scale_scope",
     "max_axis_scope": "max_axis_scale_scope",
     "aspect_scope": "aspect_scale_scope",
-    "enforce_grayscale": "enforce_greyscale",
-    "grayscale": "enforce_greyscale",
-    "greyscale": "enforce_greyscale",
 }
 
 LEGACY_ACTION_MAP = {"clamp": "shrink", "fade_clamp": "fade_shrink"}

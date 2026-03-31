@@ -40,14 +40,6 @@ class ObjectConstraintPanel(lf.ui.Panel):
             setattr(settings, attr, bool(value))
             self._save(settings)
 
-    def _draw_enforce_greyscale(self, layout, settings, guard):
-        changed, value = layout.checkbox("Enforce greyscale", bool(getattr(settings, "enforce_greyscale")))
-        if changed:
-            settings.enforce_greyscale = bool(value)
-            self._save(settings)
-            if guard is not None and bool(value):
-                guard.request_manual_greyscale()
-
     def _draw_input_int(self, layout, settings, attr: str, label: str, step: int = 1, step_fast: int = 100):
         changed, value = layout.input_int(label, int(getattr(settings, attr)), step=step, step_fast=step_fast)
         if changed:
@@ -120,9 +112,6 @@ class ObjectConstraintPanel(lf.ui.Panel):
         layout.text_colored(f"Current params -> max_axis[action={guard.last_rule_values['max_axis']['action']}, opacity_mult={guard.last_rule_values['max_axis']['opacity_multiplier']:.4f}, scale_mult={guard.last_rule_values['max_axis']['scale_multiplier']:.4f}]", (0.8, 0.8, 0.95, 1.0))
         layout.text_colored(f"Current params -> aspect[action={guard.last_rule_values['aspect']['action']}, opacity_mult={guard.last_rule_values['aspect']['opacity_multiplier']:.4f}, scale_mult={guard.last_rule_values['aspect']['scale_multiplier']:.4f}]", (0.8, 0.8, 0.95, 1.0))
         layout.text_colored(f"Last counts -> radius={guard.last_counts['radius']}, max_axis={guard.last_counts['max_axis']}, aspect={guard.last_counts['aspect']}", (0.8, 0.8, 0.8, 1.0))
-        layout.text_colored(f"Greyscale -> enabled={bool(getattr(guard.settings, 'enforce_greyscale', False))}, last_iteration={guard.last_greyscale_iteration}, last_affected={guard.last_greyscale_affected:,}", (0.85, 0.85, 0.95, 1.0))
-        greyscale_fields = ", ".join(guard.last_greyscale_fields) if guard.last_greyscale_fields else "(none)"
-        layout.text_colored(f"Greyscale targets: {self._safe_text(greyscale_fields)}", (0.85, 0.85, 0.95, 1.0))
         actions_text = ", ".join(guard.last_actions) if guard.last_actions else "(none)"
         layout.text_colored(f"Last actions: {self._safe_text(actions_text)}", (0.8, 0.9, 0.8, 1.0))
         layout.text_colored(f"Status: {self._safe_text(guard.status_message)}", (0.7, 0.9, 1.0, 1.0))
@@ -143,21 +132,16 @@ class ObjectConstraintPanel(lf.ui.Panel):
         if layout.button("Run suppression once now", (-1, 30 * scale)):
             guard.request_manual_prune()
             self._redraw()
-        if layout.button("Apply greyscale now", (-1, 30 * scale)):
-            guard.request_manual_greyscale()
-            self._redraw()
         if layout.button("Clear soft-delete mask", (-1, 30 * scale)):
             guard.clear_old_mask_now()
             self._redraw()
 
-    def _draw_settings_io(self, layout, settings, guard):
+    def _draw_settings_io(self, layout, settings):
         layout.separator()
         layout.label("Persistence")
         scale = layout.get_dpi_scale()
         if layout.button("Reload saved settings", (-1, 28 * scale)):
             load_persistent_settings(settings)
-            if guard is not None and bool(getattr(settings, "enforce_greyscale", False)):
-                guard.request_manual_greyscale()
             self._redraw()
         if layout.button("Save settings now", (-1, 28 * scale)):
             save_persistent_settings(settings)
@@ -168,7 +152,6 @@ class ObjectConstraintPanel(lf.ui.Panel):
         guard = get_pruner()
         layout.label("General")
         self._draw_bool(layout, settings, "enabled", "Enabled")
-        self._draw_enforce_greyscale(layout, settings, guard)
         self._draw_bool(layout, settings, "log_each_hit", "Log updates")
         self._draw_input_text(layout, settings, "warmup_iters", "Warmup iterations or %")
         self._draw_input_text(layout, settings, "stop_iters", "Stop iterations or %")
@@ -188,4 +171,4 @@ class ObjectConstraintPanel(lf.ui.Panel):
             return
         self._draw_runtime(layout, guard)
         self._draw_manual_controls(layout, guard)
-        self._draw_settings_io(layout, settings, guard)
+        self._draw_settings_io(layout, settings)
