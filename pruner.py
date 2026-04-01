@@ -14,6 +14,7 @@ from .settings import GuardSettings, save_persistent_settings
 _EPS = 1e-8
 _PLUGIN_OWNER = "Lumi_GS_pruning"
 _PRUNER = None
+_CALLBACK_HANDLER = None
 _RULES = ("radius", "max_axis", "aspect")
 _THRESHOLD_ATTRS = {
     "radius": ("radius_start", "radius_end"),
@@ -21,28 +22,6 @@ _THRESHOLD_ATTRS = {
     "aspect": ("max_aspect_start", "max_aspect_end"),
 }
 _GREYSCALE_WEIGHTS = (0.2126, 0.7152, 0.0722)
-_GREYSCALE_COLOR_ATTRS = (
-    "features_dc_raw",
-    "features_rest_raw",
-    "sh0_raw",
-    "shs_dc_raw",
-    "shs_rest_raw",
-    "shs_raw",
-    "colors_raw",
-    "rgb_raw",
-    "color_raw",
-    "albedo_raw",
-    "features_dc",
-    "features_rest",
-    "sh0",
-    "shs_dc",
-    "shs_rest",
-    "shs",
-    "colors",
-    "rgb",
-    "color",
-    "albedo",
-)
 
 
 def get_pruner():
@@ -52,6 +31,12 @@ def get_pruner():
 def _dispatch_training_start(*args, **kwargs):
     if _PRUNER is not None:
         return _PRUNER.on_training_start(*args, **kwargs)
+    return None
+
+
+def _dispatch_iteration_start(*args, **kwargs):
+    if _PRUNER is not None:
+        return _PRUNER.on_iteration_start(*args, **kwargs)
     return None
 
 
@@ -67,16 +52,47 @@ def _dispatch_training_end(*args, **kwargs):
     return None
 
 
+def _install_callback_handler():
+    global _CALLBACK_HANDLER
+    handler_cls = getattr(lf, "ScopedHandler", None) or getattr(lf, "ControlSession", None)
+    if handler_cls is None:
+        _CALLBACK_HANDLER = None
+        lf.on_training_start(_dispatch_training_start)
+        lf.on_iteration_start(_dispatch_iteration_start)
+        lf.on_post_step(_dispatch_post_step)
+        lf.on_training_end(_dispatch_training_end)
+        return
+    try:
+        handler = handler_cls()
+        handler.on_training_start(_dispatch_training_start)
+        handler.on_iteration_start(_dispatch_iteration_start)
+        handler.on_post_step(_dispatch_post_step)
+        handler.on_training_end(_dispatch_training_end)
+        _CALLBACK_HANDLER = handler
+    except Exception as exc:
+        _CALLBACK_HANDLER = None
+        lf.log.warn(f"[{_PLUGIN_OWNER}] Scoped callback registration failed; falling back to global hooks: {exc}")
+        lf.on_training_start(_dispatch_training_start)
+        lf.on_iteration_start(_dispatch_iteration_start)
+        lf.on_post_step(_dispatch_post_step)
+        lf.on_training_end(_dispatch_training_end)
+
+
 def install_pruner():
     global _PRUNER
+    uninstall_pruner()
     _PRUNER = ObjectConstraintPruner()
-    lf.on_training_start(_dispatch_training_start)
-    lf.on_post_step(_dispatch_post_step)
-    lf.on_training_end(_dispatch_training_end)
+    _install_callback_handler()
 
 
 def uninstall_pruner():
-    global _PRUNER
+    global _PRUNER, _CALLBACK_HANDLER
+    if _CALLBACK_HANDLER is not None:
+        try:
+            _CALLBACK_HANDLER.clear()
+        except Exception as exc:
+            lf.log.warn(f"[{_PLUGIN_OWNER}] Failed to clear callback handler: {exc}")
+        _CALLBACK_HANDLER = None
     _PRUNER = None
 
 
@@ -215,7 +231,15 @@ class ObjectConstraintPruner:
         coeffs[:, :, 2] = gray_ch
         return True
 
-    def _iter_greyscale_targets(self, scene):
+    def _iter_greyscale_targets(self, scene, prefer_training: bool = False):
+        if prefer_training:
+            try:
+                training_model = scene.training_model()
+            except Exception:
+                training_model = None
+            if training_model is not None:
+                yield "training_model", training_model
+                return
         found_any = False
         try:
             nodes = scene.get_nodes()
@@ -255,7 +279,8 @@ class ObjectConstraintPruner:
         changed_targets: list[str] = []
         failures: list[str] = []
         affected = 0
-        for label, splat_data in self._iter_greyscale_targets(scene):
+        training_active = self._is_training_active()
+        for label, splat_data in self._iter_greyscale_targets(scene, prefer_training=training_active):
             try:
                 point_count = int(getattr(splat_data, "num_points", 0))
                 if point_count <= 0:
@@ -277,16 +302,7 @@ class ObjectConstraintPruner:
             details = f" Failures: {'; '.join(failures[:3])}" if failures else ""
             self._set_status(f"No writable greyscale targets were updated.{details}", level="warn")
             return 0
-        try:
-            scene.notify_changed()
-        except Exception:
-            pass
-        ctx = self._trainer_context(refresh=False)
-        if ctx is not None and hasattr(ctx, "refresh"):
-            try:
-                ctx.refresh()
-            except Exception:
-                pass
+        self._sync_scene_after_edit(scene, training_active=training_active)
         if manual_trigger:
             message = f"Manual greyscale applied to {affected:,} gaussians across {len(changed_targets)} target(s): {', '.join(changed_targets)}"
             if failures:
@@ -333,6 +349,47 @@ class ObjectConstraintPruner:
             except Exception:
                 pass
         return ctx
+
+    def _current_scene_model(self, scene=None, prefer_training: bool | None = None, allow_combined_fallback: bool = True):
+        scene = lf.get_scene() if scene is None else scene
+        if scene is None:
+            return None
+        if prefer_training is None:
+            prefer_training = self._is_training_active()
+        if prefer_training:
+            try:
+                model = scene.training_model()
+            except Exception:
+                model = None
+            if model is not None:
+                return model
+        if allow_combined_fallback:
+            try:
+                model = scene.combined_model()
+            except Exception:
+                model = None
+            if model is not None:
+                return model
+        return None
+
+    def _sync_scene_after_edit(self, scene, training_active: bool | None = None):
+        if scene is None:
+            return False
+        if training_active is None:
+            training_active = self._is_training_active()
+        if training_active:
+            return False
+        try:
+            scene.notify_changed()
+        except Exception:
+            pass
+        ctx = self._trainer_context(refresh=False)
+        if ctx is not None and hasattr(ctx, "refresh"):
+            try:
+                ctx.refresh()
+            except Exception:
+                pass
+        return True
 
     def _trainer_state_text(self) -> str:
         try:
@@ -636,14 +693,9 @@ class ObjectConstraintPruner:
             self._request_redraw()
             return
         scene = lf.get_scene()
-        model = scene.combined_model() if scene is not None else None
+        model = self._current_scene_model(scene, prefer_training=True) if scene is not None else None
         if model is not None and pruning_enabled:
             self._clear_deleted_mask(model)
-            if scene is not None:
-                try:
-                    scene.notify_changed()
-                except Exception:
-                    pass
         if pruning_enabled:
             if self.settings.center_mode == "manual":
                 self.center_xyz = tuple(float(v) for v in self.settings.center)
@@ -708,7 +760,7 @@ class ObjectConstraintPruner:
         if scene is None:
             self._set_status("No scene loaded. Open a scene first.", level="warn")
             return None
-        model = scene.combined_model()
+        model = self._current_scene_model(scene, prefer_training=self._is_training_active())
         if model is None:
             self._set_status("No Gaussian model available yet.", level="warn")
             return None
@@ -814,7 +866,8 @@ class ObjectConstraintPruner:
         if scene is None:
             self._set_status("No scene loaded. Open a scene first.", level="warn")
             return 0
-        model = scene.combined_model()
+        training_active = self._is_training_active()
+        model = self._current_scene_model(scene, prefer_training=training_active)
         if model is None:
             self._set_status("No Gaussian model available yet.", level="warn")
             return 0
@@ -853,16 +906,7 @@ class ObjectConstraintPruner:
                 if self._apply_action(model, rule_mask, rule_cfg):
                     actions_taken.append(f"{rule_name}:{rule_cfg['action']}")
                     affected_union = rule_mask if affected_union is None else (affected_union | rule_mask)
-            try:
-                scene.notify_changed()
-            except Exception:
-                pass
-            ctx = self._trainer_context(refresh=False)
-            if ctx is not None and hasattr(ctx, "refresh"):
-                try:
-                    ctx.refresh()
-                except Exception:
-                    pass
+            self._sync_scene_after_edit(scene, training_active=training_active)
         except Exception as exc:
             self._set_status(f"Suppression failed: {exc}", level="error")
             return 0
