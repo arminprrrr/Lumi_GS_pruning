@@ -23,7 +23,6 @@ _THRESHOLD_ATTRS = {
 }
 _GREYSCALE_WEIGHTS = (0.2126, 0.7152, 0.0722)
 
-
 def get_pruner():
     return _PRUNER
 
@@ -108,6 +107,7 @@ class ObjectConstraintPruner:
         self.pending_manual_greyscale = False
         self.last_seen_iteration = -1
         self.last_pruned_iteration = -1
+        self.last_processed_iteration = -1
         self.post_step_calls = 0
         self.stale_iteration_hits = 0
         self.iteration_source = "startup"
@@ -239,7 +239,7 @@ class ObjectConstraintPruner:
                 training_model = None
             if training_model is not None:
                 yield "training_model", training_model
-                return
+            return
         found_any = False
         try:
             nodes = scene.get_nodes()
@@ -350,12 +350,14 @@ class ObjectConstraintPruner:
                 pass
         return ctx
 
-    def _current_scene_model(self, scene=None, prefer_training: bool | None = None, allow_combined_fallback: bool = True):
+    def _current_scene_model(self, scene=None, prefer_training: bool | None = None, allow_combined_fallback: bool | None = None):
         scene = lf.get_scene() if scene is None else scene
         if scene is None:
             return None
         if prefer_training is None:
             prefer_training = self._is_training_active()
+        if allow_combined_fallback is None:
+            allow_combined_fallback = not bool(prefer_training)
         if prefer_training:
             try:
                 model = scene.training_model()
@@ -363,6 +365,8 @@ class ObjectConstraintPruner:
                 model = None
             if model is not None:
                 return model
+            if not allow_combined_fallback:
+                return None
         if allow_combined_fallback:
             try:
                 model = scene.combined_model()
@@ -465,8 +469,8 @@ class ObjectConstraintPruner:
                 pass
         return candidates
 
-    def _resolve_callback_iteration(self) -> int:
-        candidates = self._iteration_candidates(refresh=True)
+    def _resolve_callback_iteration(self) -> int | None:
+        candidates: list[tuple[str, int]] = []
         if self.iteration_hint is not None:
             try:
                 hint_value = int(self.iteration_hint)
@@ -474,35 +478,33 @@ class ObjectConstraintPruner:
                     candidates.append(("iteration_start_hint", hint_value))
             except Exception:
                 pass
-        advanced = [(name, value) for name, value in candidates if value > self.last_seen_iteration]
+        candidates.extend(self._iteration_candidates(refresh=True))
+        target_floor = max(int(self.last_pruned_iteration), int(getattr(self, "last_processed_iteration", -1)))
+        advanced = [(name, value) for name, value in candidates if value > target_floor]
         if advanced:
             name, value = max(advanced, key=lambda item: item[1])
             self.iteration_source = name
             self.stale_iteration_hits = 0
             self.iteration_hint = None
             return int(value)
+        self.stale_iteration_hits += 1
         if candidates:
             name, value = max(candidates, key=lambda item: item[1])
-            fallback = max(int(self.last_seen_iteration) + 1, int(value))
-            self.stale_iteration_hits += 1
-            self.iteration_source = f"{name}->monotonic"
+            self.iteration_source = f"{name}->stale"
             if self.stale_iteration_hits in {3, 10} or (self.stale_iteration_hits % 1000 == 0):
                 self._set_status(
-                    f"Iteration source '{name}' stayed at {value}; continuing with monotonic fallback {fallback}.",
+                    f"Iteration source '{name}' stayed at {value}; skipping this callback to avoid duplicate edits.",
                     level="warn",
                 )
-            self.iteration_hint = None
-            return int(fallback)
-        fallback = max(0, int(self.last_seen_iteration) + 1)
-        self.stale_iteration_hits += 1
-        self.iteration_source = "local_monotonic"
-        if self.stale_iteration_hits in {3, 10} or (self.stale_iteration_hits % 1000 == 0):
-            self._set_status(
-                f"Training callback has no iteration source; continuing with local fallback {fallback}.",
-                level="warn",
-            )
+        else:
+            self.iteration_source = "no_iteration_source"
+            if self.stale_iteration_hits in {3, 10} or (self.stale_iteration_hits % 1000 == 0):
+                self._set_status(
+                    "Training callback has no usable iteration source; skipping this callback.",
+                    level="warn",
+                )
         self.iteration_hint = None
-        return int(fallback)
+        return None
 
     def _current_iteration(self) -> int:
         candidates = self._iteration_candidates(refresh=True)
@@ -661,8 +663,7 @@ class ObjectConstraintPruner:
             value = int(iteration)
             self.iteration_hint = value
             self.iteration_source = "app_state->post_step"
-            self.last_seen_iteration = max(self.last_seen_iteration, value)
-            self.current_thresholds(self.last_seen_iteration)
+            self.current_thresholds(value)
             self._request_redraw()
         except Exception as exc:
             self._set_status(f"Iteration signal failed: {exc}", level="error")
@@ -693,7 +694,7 @@ class ObjectConstraintPruner:
             self._request_redraw()
             return
         scene = lf.get_scene()
-        model = self._current_scene_model(scene, prefer_training=True) if scene is not None else None
+        model = self._current_scene_model(scene, prefer_training=True, allow_combined_fallback=False) if scene is not None else None
         if model is not None and pruning_enabled:
             self._clear_deleted_mask(model)
         if pruning_enabled:
@@ -725,7 +726,11 @@ class ObjectConstraintPruner:
         try:
             self.post_step_calls += 1
             iteration = self._resolve_callback_iteration()
+            if iteration is None:
+                self._request_redraw()
+                return
             self.last_seen_iteration = max(self.last_seen_iteration, int(iteration))
+            self.last_processed_iteration = max(self.last_processed_iteration, int(iteration))
             self.current_thresholds(self.last_seen_iteration)
             if not bool(self.settings.enabled):
                 self.pending_manual_prune = False
@@ -760,7 +765,7 @@ class ObjectConstraintPruner:
         if scene is None:
             self._set_status("No scene loaded. Open a scene first.", level="warn")
             return None
-        model = self._current_scene_model(scene, prefer_training=self._is_training_active())
+        model = self._current_scene_model(scene, prefer_training=self._is_training_active(), allow_combined_fallback=not self._is_training_active())
         if model is None:
             self._set_status("No Gaussian model available yet.", level="warn")
             return None
