@@ -675,6 +675,7 @@ class ObjectConstraintPruner:
         self.total_removed = 0
         self.last_seen_iteration = -1
         self.last_pruned_iteration = -1
+        self.last_processed_iteration = -1
         self.post_step_calls = 0
         self.stale_iteration_hits = 0
         self.iteration_source = "training_start"
@@ -753,6 +754,10 @@ class ObjectConstraintPruner:
         del args, kwargs
         self.pending_manual_prune = False
         self.pending_manual_greyscale = False
+        if self._is_training_active():
+            self._set_status_quiet("Ignored stale training_end callback while a new training run is already active.")
+            self._request_redraw()
+            return
         self._set_status("Training ended.")
         self._request_redraw()
 
