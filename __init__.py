@@ -1,6 +1,6 @@
 import lichtfeld as lf
 
-from .pruner import install_pruner, uninstall_pruner
+from .pruner import install_pruner, uninstall_pruner, set_runtime_mode
 from .settings import GuardSettings, initialize_runtime_settings, save_persistent_settings
 
 _PLUGIN_NAME = "Lumi_GS_pruning"
@@ -42,13 +42,13 @@ def on_load():
     global _PRUNER_INSTALLED
     initialize_runtime_settings(GuardSettings.get_instance())
 
-    install_pruner()
+    _register_optional_ui()
+    mode = "ui" if _REGISTERED_CLASSES else "headless/no-ui"
+    set_runtime_mode(mode)
+
+    install_pruner(runtime_mode=mode)
     _PRUNER_INSTALLED = True
     lf.log.info(f"[{_PLUGIN_NAME}] Training hooks installed")
-
-    _register_optional_ui()
-
-    mode = "ui" if _REGISTERED_CLASSES else "headless/no-ui"
     lf.log.info(f"{_PLUGIN_NAME} loaded ({mode})")
 
 

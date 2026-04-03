@@ -15,6 +15,8 @@ _EPS = 1e-8
 _PLUGIN_OWNER = "Lumi_GS_pruning"
 _PRUNER = None
 _CALLBACK_HANDLER = None
+_RUNTIME_MODE = "auto"
+_HOOK_REGISTRATION = "unknown"
 _RULES = ("radius", "max_axis", "aspect")
 _THRESHOLD_ATTRS = {
     "radius": ("radius_start", "radius_end"),
@@ -23,8 +25,25 @@ _THRESHOLD_ATTRS = {
 }
 _GREYSCALE_WEIGHTS = (0.2126, 0.7152, 0.0722)
 
+
 def get_pruner():
     return _PRUNER
+
+
+def set_runtime_mode(mode: str | None):
+    global _RUNTIME_MODE
+    text = str(mode or "auto").strip().lower()
+    if text in {"headless/no-ui", "headless_no_ui", "headless-no-ui", "headless"}:
+        _RUNTIME_MODE = "headless"
+    elif text in {"ui", "retained-ui", "retained_ui", "retained"}:
+        _RUNTIME_MODE = "ui"
+    else:
+        _RUNTIME_MODE = "auto"
+
+
+def get_runtime_mode() -> str:
+    return str(_RUNTIME_MODE)
+
 
 
 def _dispatch_training_start(*args, **kwargs):
@@ -33,10 +52,12 @@ def _dispatch_training_start(*args, **kwargs):
     return None
 
 
+
 def _dispatch_iteration_start(*args, **kwargs):
     if _PRUNER is not None:
         return _PRUNER.on_iteration_start(*args, **kwargs)
     return None
+
 
 
 def _dispatch_post_step(*args, **kwargs):
@@ -45,21 +66,64 @@ def _dispatch_post_step(*args, **kwargs):
     return None
 
 
+
 def _dispatch_training_end(*args, **kwargs):
     if _PRUNER is not None:
         return _PRUNER.on_training_end(*args, **kwargs)
     return None
 
 
+
+def _app_state_signal_value(name: str, default=None):
+    if AppState is None:
+        return default
+    try:
+        signal = getattr(AppState, name)
+    except Exception:
+        return default
+    try:
+        return signal.value
+    except Exception:
+        return default
+
+
+
+def _is_headless_runtime() -> bool:
+    if _RUNTIME_MODE == "headless":
+        return True
+    if _RUNTIME_MODE == "ui":
+        return False
+    value = _app_state_signal_value("is_headless", None)
+    if value is not None:
+        try:
+            return bool(value)
+        except Exception:
+            pass
+    return False
+
+
+
+def _register_global_hooks():
+    global _HOOK_REGISTRATION
+    lf.on_training_start(_dispatch_training_start)
+    lf.on_iteration_start(_dispatch_iteration_start)
+    lf.on_post_step(_dispatch_post_step)
+    lf.on_training_end(_dispatch_training_end)
+    _HOOK_REGISTRATION = "global"
+
+
+
 def _install_callback_handler():
-    global _CALLBACK_HANDLER
+    global _CALLBACK_HANDLER, _HOOK_REGISTRATION
+    if _is_headless_runtime():
+        _CALLBACK_HANDLER = None
+        _register_global_hooks()
+        return
+
     handler_cls = getattr(lf, "ScopedHandler", None) or getattr(lf, "ControlSession", None)
     if handler_cls is None:
         _CALLBACK_HANDLER = None
-        lf.on_training_start(_dispatch_training_start)
-        lf.on_iteration_start(_dispatch_iteration_start)
-        lf.on_post_step(_dispatch_post_step)
-        lf.on_training_end(_dispatch_training_end)
+        _register_global_hooks()
         return
     try:
         handler = handler_cls()
@@ -68,30 +132,37 @@ def _install_callback_handler():
         handler.on_post_step(_dispatch_post_step)
         handler.on_training_end(_dispatch_training_end)
         _CALLBACK_HANDLER = handler
+        _HOOK_REGISTRATION = handler_cls.__name__
     except Exception as exc:
         _CALLBACK_HANDLER = None
         lf.log.warn(f"[{_PLUGIN_OWNER}] Scoped callback registration failed; falling back to global hooks: {exc}")
-        lf.on_training_start(_dispatch_training_start)
-        lf.on_iteration_start(_dispatch_iteration_start)
-        lf.on_post_step(_dispatch_post_step)
-        lf.on_training_end(_dispatch_training_end)
+        _register_global_hooks()
 
 
-def install_pruner():
+
+def install_pruner(runtime_mode: str | None = None):
     global _PRUNER
+    if runtime_mode is not None:
+        set_runtime_mode(runtime_mode)
     uninstall_pruner()
     _PRUNER = ObjectConstraintPruner()
     _install_callback_handler()
+    try:
+        lf.log.info(f"[{_PLUGIN_OWNER}] Runtime mode={get_runtime_mode()} hook_registration={_HOOK_REGISTRATION}")
+    except Exception:
+        pass
+
 
 
 def uninstall_pruner():
-    global _PRUNER, _CALLBACK_HANDLER
+    global _PRUNER, _CALLBACK_HANDLER, _HOOK_REGISTRATION
     if _CALLBACK_HANDLER is not None:
         try:
             _CALLBACK_HANDLER.clear()
         except Exception as exc:
             lf.log.warn(f"[{_PLUGIN_OWNER}] Failed to clear callback handler: {exc}")
         _CALLBACK_HANDLER = None
+    _HOOK_REGISTRATION = "unknown"
     _PRUNER = None
 
 
@@ -121,6 +192,10 @@ class ObjectConstraintPruner:
         self.last_greyscale_affected = 0
         self.total_greyscale_affected = 0
         self.last_greyscale_fields: list[str] = []
+        self._last_scene = None
+        self._last_scene_source = "none"
+        self._scene_wait_hits = 0
+        self._model_wait_hits = 0
         self._append_status_log("Idle.", level="info")
         self._subscribe_app_state()
 
@@ -177,6 +252,17 @@ class ObjectConstraintPruner:
     def _set_status_quiet(self, message: str):
         self.status_message = message
 
+    def _set_wait_status(self, reason: str, *, manual_trigger: bool = False, level: str = "warn"):
+        if manual_trigger:
+            self._set_status(reason, level=level)
+            return
+        self._set_status_quiet(reason)
+        hits_attr = "_scene_wait_hits" if "scene" in reason.lower() else "_model_wait_hits"
+        hits = int(getattr(self, hits_attr, 0)) + 1
+        setattr(self, hits_attr, hits)
+        if hits in {3, 10} or (hits % 250 == 0):
+            self._set_status(reason, level="warn")
+
     def _fmt_center(self, center_xyz):
         if center_xyz is None:
             return "<unset>"
@@ -209,7 +295,7 @@ class ObjectConstraintPruner:
         n = self._shape_dim(colors, 0, 0)
         if n <= 0:
             return None
-        gray = (colors[:, 0] * 0.2126) + (colors[:, 1] * 0.7152) + (colors[:, 2] * 0.0722)
+        gray = (colors[:, 0] * _GREYSCALE_WEIGHTS[0]) + (colors[:, 1] * _GREYSCALE_WEIGHTS[1]) + (colors[:, 2] * _GREYSCALE_WEIGHTS[2])
         gray_col = gray.unsqueeze(1)
         out = lf.Tensor.zeros([n, 3], device=colors.device, dtype=colors.dtype)
         out[:, 0] = gray_col
@@ -224,23 +310,50 @@ class ObjectConstraintPruner:
             return False
         if self._shape_dim(coeffs, 1, 0) <= 0:
             return False
-        gray = (coeffs[:, :, 0] * 0.2126) + (coeffs[:, :, 1] * 0.7152) + (coeffs[:, :, 2] * 0.0722)
+        gray = (coeffs[:, :, 0] * _GREYSCALE_WEIGHTS[0]) + (coeffs[:, :, 1] * _GREYSCALE_WEIGHTS[1]) + (coeffs[:, :, 2] * _GREYSCALE_WEIGHTS[2])
         gray_ch = gray.unsqueeze(2)
         coeffs[:, :, 0] = gray_ch
         coeffs[:, :, 1] = gray_ch
         coeffs[:, :, 2] = gray_ch
         return True
 
-    def _iter_greyscale_targets(self, scene, prefer_training: bool = False):
-        if prefer_training:
+    def _candidate_scenes(self):
+        out: list[tuple[str, Any]] = []
+        seen: set[int] = set()
+        for label, getter in (
+            ("scene", getattr(lf, "get_scene", None)),
+            ("render_scene", getattr(lf, "get_render_scene", None)),
+        ):
+            if getter is None:
+                continue
             try:
-                training_model = scene.training_model()
+                scene = getter()
             except Exception:
-                training_model = None
-            if training_model is not None:
-                yield "training_model", training_model
-            return
-        found_any = False
+                scene = None
+            if scene is None:
+                continue
+            key = id(scene)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((label, scene))
+        if self._last_scene is not None:
+            key = id(self._last_scene)
+            if key not in seen:
+                out.append((f"cached:{self._last_scene_source}", self._last_scene))
+        return out
+
+    def _resolve_scene(self):
+        candidates = self._candidate_scenes()
+        if not candidates:
+            return None, "none"
+        label, scene = candidates[0]
+        self._last_scene = scene
+        self._last_scene_source = label
+        self._scene_wait_hits = 0
+        return scene, label
+
+    def _iter_node_splat_models(self, scene):
         try:
             nodes = scene.get_nodes()
         except Exception:
@@ -250,10 +363,30 @@ class ObjectConstraintPruner:
                 splat_data = node.splat_data()
             except Exception:
                 splat_data = None
-            if splat_data is None:
-                continue
+            if splat_data is not None:
+                yield f"node:{getattr(node, 'name', '<unnamed>')}", splat_data
+
+    def _iter_greyscale_targets(self, scene, prefer_training: bool = False):
+        if prefer_training:
+            try:
+                training_model = scene.training_model()
+            except Exception:
+                training_model = None
+            if training_model is not None:
+                yield "training_model", training_model
+            try:
+                combined_model = scene.combined_model()
+            except Exception:
+                combined_model = None
+            if combined_model is not None and combined_model is not training_model:
+                yield "combined_model", combined_model
+            for label, splat_data in self._iter_node_splat_models(scene):
+                yield label, splat_data
+            return
+        found_any = False
+        for label, splat_data in self._iter_node_splat_models(scene):
             found_any = True
-            yield f"node:{getattr(node, 'name', '<unnamed>')}", splat_data
+            yield label, splat_data
         if found_any:
             return
         try:
@@ -262,24 +395,63 @@ class ObjectConstraintPruner:
             training_model = None
         if training_model is not None:
             yield "training_model", training_model
-            return
         try:
             combined_model = scene.combined_model()
         except Exception:
             combined_model = None
-        if combined_model is not None:
+        if combined_model is not None and combined_model is not training_model:
             yield "combined_model", combined_model
+
+    def _resolve_scene_and_model(
+        self,
+        *,
+        prefer_training: bool | None = None,
+        allow_combined_fallback: bool = True,
+        allow_node_fallback: bool = True,
+    ):
+        if prefer_training is None:
+            prefer_training = self._is_training_active()
+        scene, scene_source = self._resolve_scene()
+        if scene is None:
+            return None, None, "no_scene"
+
+        model = None
+        model_source = "none"
+        if prefer_training:
+            try:
+                model = scene.training_model()
+            except Exception:
+                model = None
+            if model is not None:
+                self._model_wait_hits = 0
+                return scene, model, f"{scene_source}:training_model"
+        if allow_combined_fallback:
+            try:
+                model = scene.combined_model()
+            except Exception:
+                model = None
+            if model is not None:
+                self._model_wait_hits = 0
+                return scene, model, f"{scene_source}:combined_model"
+        if allow_node_fallback:
+            for label, splat_data in self._iter_node_splat_models(scene):
+                self._model_wait_hits = 0
+                return scene, splat_data, f"{scene_source}:{label}"
+        return scene, None, f"{scene_source}:no_model"
 
     def apply_greyscale_once(self, manual_trigger: bool = False, forced_iteration: int | None = None):
         iteration = int(forced_iteration if forced_iteration is not None else self._current_iteration())
-        scene = lf.get_scene()
+        training_active = self._is_training_active()
+        scene, _model, source = self._resolve_scene_and_model(prefer_training=training_active, allow_combined_fallback=True, allow_node_fallback=True)
         if scene is None:
-            self._set_status("No scene loaded. Open a scene first.", level="warn")
+            self._set_wait_status(
+                f"Scene not ready yet for greyscale at iter={iteration}; skipping until LichtFeld exposes a scene object.",
+                manual_trigger=manual_trigger,
+            )
             return 0
         changed_targets: list[str] = []
         failures: list[str] = []
         affected = 0
-        training_active = self._is_training_active()
         for label, splat_data in self._iter_greyscale_targets(scene, prefer_training=training_active):
             try:
                 point_count = int(getattr(splat_data, "num_points", 0))
@@ -300,7 +472,11 @@ class ObjectConstraintPruner:
         self.last_greyscale_fields = list(changed_targets)
         if not changed_targets:
             details = f" Failures: {'; '.join(failures[:3])}" if failures else ""
-            self._set_status(f"No writable greyscale targets were updated.{details}", level="warn")
+            self._set_wait_status(
+                f"No writable greyscale targets were updated from {source}.{details}",
+                manual_trigger=manual_trigger,
+                level="warn",
+            )
             return 0
         self._sync_scene_after_edit(scene, training_active=training_active)
         if manual_trigger:
@@ -309,7 +485,7 @@ class ObjectConstraintPruner:
                 message += f" Failures: {'; '.join(failures[:3])}"
             self._set_status(message, level="warn" if failures else "info")
         else:
-            message = f"Greyscale enforced on {affected:,} gaussians across {len(changed_targets)} target(s)."
+            message = f"Greyscale enforced on {affected:,} gaussians across {len(changed_targets)} target(s) via {source}."
             if failures:
                 message += f" Failures: {'; '.join(failures[:3])}"
                 self._set_status(message, level="warn")
@@ -350,32 +526,6 @@ class ObjectConstraintPruner:
                 pass
         return ctx
 
-    def _current_scene_model(self, scene=None, prefer_training: bool | None = None, allow_combined_fallback: bool | None = None):
-        scene = lf.get_scene() if scene is None else scene
-        if scene is None:
-            return None
-        if prefer_training is None:
-            prefer_training = self._is_training_active()
-        if allow_combined_fallback is None:
-            allow_combined_fallback = not bool(prefer_training)
-        if prefer_training:
-            try:
-                model = scene.training_model()
-            except Exception:
-                model = None
-            if model is not None:
-                return model
-            if not allow_combined_fallback:
-                return None
-        if allow_combined_fallback:
-            try:
-                model = scene.combined_model()
-            except Exception:
-                model = None
-            if model is not None:
-                return model
-        return None
-
     def _sync_scene_after_edit(self, scene, training_active: bool | None = None):
         if scene is None:
             return False
@@ -406,6 +556,34 @@ class ObjectConstraintPruner:
             pass
         state = self._app_state_value("trainer_state", "")
         return str(state).strip()
+
+    def _trainer_phase_text(self) -> str:
+        ctx = self._trainer_context(refresh=True)
+        if ctx is not None:
+            try:
+                phase = getattr(ctx, "phase", None)
+                if callable(phase):
+                    text = str(phase()).strip()
+                    if text:
+                        return text
+            except Exception:
+                pass
+            try:
+                phase_value = getattr(ctx, "phase", None)
+                if phase_value is not None and not callable(phase_value):
+                    text = str(phase_value).strip()
+                    if text:
+                        return text
+            except Exception:
+                pass
+        phase = self._app_state_value("training_phase", "")
+        return str(phase).strip()
+
+    def _in_safe_edit_window(self) -> bool:
+        if not self._is_training_active():
+            return True
+        phase = self._trainer_phase_text().lower()
+        return phase in {"safe_control", "idle", "training_start", "training_end"}
 
     def _is_training_active(self) -> bool:
         votes: list[bool] = []
@@ -687,6 +865,8 @@ class ObjectConstraintPruner:
         self.last_greyscale_iteration = -1
         self.last_greyscale_affected = 0
         self.last_greyscale_fields = []
+        self._scene_wait_hits = 0
+        self._model_wait_hits = 0
         self.current_thresholds(0)
         pruning_enabled = bool(self.settings.enabled)
         greyscale_enabled = bool(getattr(self.settings, "enforce_greyscale", False))
@@ -694,10 +874,14 @@ class ObjectConstraintPruner:
             self._set_status("Training started. Plugin is disabled, so it will not modify the model.")
             self._request_redraw()
             return
-        scene = lf.get_scene()
-        model = self._current_scene_model(scene, prefer_training=True, allow_combined_fallback=False) if scene is not None else None
+        scene, model, source = self._resolve_scene_and_model(prefer_training=True, allow_combined_fallback=True, allow_node_fallback=True)
         if model is not None and pruning_enabled:
             self._clear_deleted_mask(model)
+        elif pruning_enabled:
+            self._set_wait_status(
+                f"Training started, but the scene/model is not ready yet ({source}). Waiting for Gaussians before applying pruning.",
+                manual_trigger=False,
+            )
         if pruning_enabled:
             if self.settings.center_mode == "manual":
                 self.center_xyz = tuple(float(v) for v in self.settings.center)
@@ -705,7 +889,7 @@ class ObjectConstraintPruner:
             else:
                 self.center_xyz = None
                 if self.capture_center_from_scene(force=True) is None:
-                    self._set_status("Training started. Waiting for Gaussians before center capture.", level="warn")
+                    self._set_wait_status("Training started. Waiting for Gaussians before center capture.", manual_trigger=False)
         if greyscale_enabled:
             self.apply_greyscale_once(manual_trigger=False, forced_iteration=0)
         self._request_redraw()
@@ -766,20 +950,23 @@ class ObjectConstraintPruner:
             self.center_xyz = tuple(float(v) for v in self.settings.center)
             self._set_status(f"Using manual center {self._fmt_center(self.center_xyz)}.")
             return self.center_xyz
-        scene = lf.get_scene()
+        scene, model, source = self._resolve_scene_and_model(
+            prefer_training=self._is_training_active(),
+            allow_combined_fallback=True,
+            allow_node_fallback=True,
+        )
         if scene is None:
-            self._set_status("No scene loaded. Open a scene first.", level="warn")
+            self._set_wait_status("Scene not ready yet for center capture; skipping until a scene becomes available.")
             return None
-        model = self._current_scene_model(scene, prefer_training=self._is_training_active(), allow_combined_fallback=not self._is_training_active())
         if model is None:
-            self._set_status("No Gaussian model available yet.", level="warn")
+            self._set_wait_status(f"No Gaussian model available yet for center capture ({source}).")
             return None
-        if int(model.num_points) == 0:
-            self._set_status("Gaussian model has zero points.", level="warn")
+        if int(getattr(model, "num_points", 0)) == 0:
+            self._set_wait_status("Gaussian model has zero points.")
             return None
         center = model.means_raw.mean(dim=0)
         self.center_xyz = (float(center[0].item()), float(center[1].item()), float(center[2].item()))
-        self._set_status(f"Captured center {self._fmt_center(self.center_xyz)}.")
+        self._set_status(f"Captured center {self._fmt_center(self.center_xyz)} from {source}.")
         return self.center_xyz
 
     def request_manual_prune(self):
@@ -808,14 +995,13 @@ class ObjectConstraintPruner:
         return out
 
     def clear_old_mask_now(self):
-        scene = lf.get_scene()
+        scene, model, source = self._resolve_scene_and_model(prefer_training=False, allow_combined_fallback=True, allow_node_fallback=True)
         if scene is None:
-            self._set_status("No scene loaded. Open a scene first.", level="warn")
+            self._set_status("No scene is available yet. Open or prepare a scene first.", level="warn")
             self._request_redraw()
             return False
-        model = scene.combined_model()
         if model is None:
-            self._set_status("No Gaussian model available yet.", level="warn")
+            self._set_status(f"No Gaussian model available yet ({source}).", level="warn")
             self._request_redraw()
             return False
         ok = self._clear_deleted_mask(model)
@@ -824,9 +1010,9 @@ class ObjectConstraintPruner:
                 scene.notify_changed()
             except Exception:
                 pass
-            self._set_status("Cleared soft-delete mask on combined_model.")
+            self._set_status(f"Cleared soft-delete mask on {source}.")
         else:
-            self._set_status("Failed to clear soft-delete mask on combined_model.", level="warn")
+            self._set_status(f"Failed to clear soft-delete mask on {source}.", level="warn")
         self._request_redraw()
         return ok
 
@@ -872,17 +1058,29 @@ class ObjectConstraintPruner:
             if iteration % max(1, int(s.apply_every)) != 0:
                 self._set_status(f"Skipping iteration {iteration} (apply_every={int(s.apply_every)}).")
                 return 0
-        scene = lf.get_scene()
-        if scene is None:
-            self._set_status("No scene loaded. Open a scene first.", level="warn")
-            return 0
         training_active = self._is_training_active()
-        model = self._current_scene_model(scene, prefer_training=training_active)
-        if model is None:
-            self._set_status("No Gaussian model available yet.", level="warn")
+        scene, model, source = self._resolve_scene_and_model(
+            prefer_training=training_active,
+            allow_combined_fallback=True,
+            allow_node_fallback=True,
+        )
+        if scene is None:
+            self._set_wait_status(
+                f"Scene not ready yet for pruning at iter={iteration}; skipping until LichtFeld exposes a scene object.",
+                manual_trigger=manual_trigger,
+            )
             return 0
-        if int(model.num_points) == 0:
-            self._set_status("Gaussian model has zero points.", level="warn")
+        if model is None:
+            self._set_wait_status(
+                f"No Gaussian model available yet for pruning at iter={iteration} ({source}).",
+                manual_trigger=manual_trigger,
+            )
+            return 0
+        if int(getattr(model, "num_points", 0)) == 0:
+            self._set_wait_status(
+                f"Gaussian model has zero points at iter={iteration} ({source}).",
+                manual_trigger=manual_trigger,
+            )
             return 0
         if s.center_mode == "manual":
             self.center_xyz = tuple(float(v) for v in s.center)
@@ -895,7 +1093,7 @@ class ObjectConstraintPruner:
             return 0
         if counts["radius"] + counts["max_axis"] + counts["aspect"] == 0:
             self.last_pruned_iteration = iteration
-            self._set_status(f"iter={iteration}: matched 0 in {profile['label']} (radius={counts['radius']}, max_axis={counts['max_axis']}, aspect={counts['aspect']})")
+            self._set_status(f"iter={iteration}: matched 0 in {profile['label']} via {source} (radius={counts['radius']}, max_axis={counts['max_axis']}, aspect={counts['aspect']})")
             return 0
         actions_taken = []
         affected_union = None
@@ -927,9 +1125,9 @@ class ObjectConstraintPruner:
         self.last_actions = actions_taken
         prefix = "manual" if manual_trigger else f"iter={iteration}"
         if not actions_taken:
-            self._set_status(f"{prefix}: matched radius={counts['radius']}, max_axis={counts['max_axis']}, aspect={counts['aspect']} in {profile['label']}, but no actions were applied.")
+            self._set_status(f"{prefix}: matched radius={counts['radius']}, max_axis={counts['max_axis']}, aspect={counts['aspect']} in {profile['label']} via {source}, but no actions were applied.")
             return affected
-        self._set_status(f"{prefix}: profile={profile['label']} affected={affected} (radius={counts['radius']}, max_axis={counts['max_axis']}, aspect={counts['aspect']}; thr_radius={self.last_thresholds['radius']:.4f}, thr_max_axis={self.last_thresholds['max_axis']:.6f}, thr_aspect={self.last_thresholds['aspect']:.4f}; source={self.iteration_source}); actions={', '.join(actions_taken)}")
+        self._set_status(f"{prefix}: profile={profile['label']} affected={affected} via {source} (radius={counts['radius']}, max_axis={counts['max_axis']}, aspect={counts['aspect']}; thr_radius={self.last_thresholds['radius']:.4f}, thr_max_axis={self.last_thresholds['max_axis']:.6f}, thr_aspect={self.last_thresholds['aspect']:.4f}; source={self.iteration_source}); actions={', '.join(actions_taken)}")
         return affected
 
     def _build_condition_masks(self, model, rule_configs: dict[str, dict[str, Any]]):
